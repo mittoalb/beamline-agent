@@ -337,6 +337,64 @@ def _needs_confirmation(name: str, arguments: dict, tool_ctx: dict) -> bool:
 PROTOCOL_ANTHROPIC = "anthropic"
 PROTOCOL_OPENAI = "openai"
 
+
+# ── backend presets ────────────────────────────────────────────────────
+# The Settings dialog exposes a "Backend" choice on top of the raw
+# `protocol` so a user doesn't have to memorise gateway URLs. The
+# preset controls (a) which `protocol` is used, (b) the URL
+# placeholder shown in the dialog, and (c) whether an API key is
+# expected. The wire protocol under the hood is unchanged: Local
+# rides `PROTOCOL_OPENAI` because every popular local runner
+# (Ollama, llama.cpp, vLLM, LM Studio) exposes an OpenAI-compatible
+# `/v1` endpoint — that's the whole reason a bespoke "local
+# protocol" isn't needed.
+BACKEND_ANTHROPIC = "anthropic-cloud"
+BACKEND_OPENAI    = "openai-cloud"
+BACKEND_LOCAL     = "local-openai"
+BACKEND_CUSTOM    = "custom"
+
+# Ordered list of (backend_id, display_label, protocol, url_placeholder,
+# needs_key). The dialog builds its combobox from this table.
+BACKEND_PRESETS = [
+    (BACKEND_ANTHROPIC, "Anthropic (cloud)", PROTOCOL_ANTHROPIC,
+     "https://gateway.example.com (Anthropic Messages — no /v1)", True),
+    (BACKEND_OPENAI,    "OpenAI (cloud)",    PROTOCOL_OPENAI,
+     "https://gateway.example.com/v1 (OpenAI)", True),
+    (BACKEND_LOCAL,     "Local — OpenAI-compatible", PROTOCOL_OPENAI,
+     "http://<host>:<port>/v1  (Ollama 11434, llama.cpp 8080, vLLM 8000, "
+     "LM Studio 1234)", False),
+    (BACKEND_CUSTOM,    "Custom",            PROTOCOL_ANTHROPIC,
+     "https://your-endpoint.example.com/…", True),
+]
+
+# Sentinel key sent to the openai client when the user leaves the
+# API-key field blank — required because the client refuses to
+# instantiate on an empty key even when the target server (a local
+# runner) doesn't care.
+_LOCAL_KEY_SENTINEL = "local-no-key"
+
+
+def _resolve_api_key(api_key: str | None) -> str:
+    """Return the api_key to actually send. Empty / None becomes the
+    local-runner sentinel so the openai client instantiates cleanly."""
+    k = (api_key or "").strip()
+    return k or _LOCAL_KEY_SENTINEL
+
+
+def _backend_from_settings(s: dict) -> str:
+    """Pick the backend id from a settings dict. Explicit `backend`
+    wins; otherwise derive from `protocol` (backward-compat for
+    settings files written before the backend field existed)."""
+    if not isinstance(s, dict):
+        return BACKEND_ANTHROPIC
+    b = (s.get("backend") or "").strip()
+    if b in {p[0] for p in BACKEND_PRESETS}:
+        return b
+    proto = s.get("protocol") or PROTOCOL_ANTHROPIC
+    if proto == PROTOCOL_ANTHROPIC:
+        return BACKEND_ANTHROPIC
+    return BACKEND_OPENAI
+
 # Cap on agentic iterations per turn — protects against runaway tool loops.
 # Kept intentionally tight (10) because a well-structured task needs few
 # rounds: read the relevant AGENTS.md ONCE, run the CLI ONCE, inspect the
@@ -583,9 +641,14 @@ def _chat_anthropic(base_url, api_key, model, system_prompt,
 
 def _chat_openai(base_url, api_key, model, system_prompt,
                  history, user_text, emit_tool, confirm, tool_ctx):
-    """Agentic loop on OpenAI Chat Completions."""
+    """Agentic loop on OpenAI Chat Completions.
+
+    ``api_key`` may be empty when talking to a local OpenAI-compatible
+    server (Ollama, llama.cpp, vLLM, LM Studio). We substitute a
+    sentinel so the openai client instantiates; the local server
+    ignores it. Cloud gateways still see whatever real key was given."""
     from openai import OpenAI
-    client = OpenAI(base_url=base_url, api_key=api_key,
+    client = OpenAI(base_url=base_url, api_key=_resolve_api_key(api_key),
                     timeout=60.0, max_retries=2)
     tools = tool_ctx.get("tool_specs_openai", []) or []
     messages = [
@@ -738,7 +801,7 @@ def _list_models(protocol, base_url, api_key, *, timeout=10.0):
         return [m.id for m in client.models.list()]
     elif protocol == PROTOCOL_OPENAI:
         from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key=api_key,
+        client = OpenAI(base_url=base_url, api_key=_resolve_api_key(api_key),
                         timeout=timeout, max_retries=0)
         return [m.id for m in client.models.list().data]
     raise ValueError(f"unknown protocol: {protocol!r}")
@@ -952,7 +1015,12 @@ class AgentChatWidget(QtWidgets.QWidget):
         url = (s.get("base_url") or "").strip()
         key = (s.get("api_key") or "").strip()
         model = (s.get("model") or "").strip()
-        if not (url and key and model):
+        # `key` is optional now — local OpenAI-compatible runners
+        # (Ollama, llama.cpp, vLLM, LM Studio) don't need one, and
+        # `_chat_openai` substitutes a sentinel when it's blank.
+        # `url` and `model` are still required — without them we
+        # have no server to talk to and no model to select.
+        if not (url and model):
             return None
         tool_ctx = _load_tool_context()
         name = (s.get("agent_name") or DEFAULT_AGENT_NAME).strip() or DEFAULT_AGENT_NAME
@@ -1269,6 +1337,22 @@ class AgentDialog(QtWidgets.QDialog):
         setup = QtWidgets.QGroupBox("Gateway")
         sl = QtWidgets.QFormLayout()
 
+        # Backend preset — cloud vs. locally-hosted. The wire protocol
+        # is derived from the backend (local rides PROTOCOL_OPENAI
+        # because every popular local runner exposes an OpenAI-compat
+        # endpoint). Power users can still override the raw Protocol
+        # below.
+        self.backend_combo = QtWidgets.QComboBox()
+        for bid, label, _proto, _placeholder, _needs_key in BACKEND_PRESETS:
+            self.backend_combo.addItem(label, bid)
+        self.backend_combo.setToolTip(
+            "Cloud API or a locally-hosted model. Local — OpenAI-"
+            "compatible works with Ollama, llama.cpp, vLLM, LM Studio "
+            "and other runners that expose a /v1 endpoint; the API-"
+            "key field can be left blank for those.")
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        sl.addRow("Backend:", self.backend_combo)
+
         self.protocol_combo = QtWidgets.QComboBox()
         self.protocol_combo.addItem("Anthropic Messages API", PROTOCOL_ANTHROPIC)
         self.protocol_combo.addItem("OpenAI Chat Completions", PROTOCOL_OPENAI)
@@ -1348,9 +1432,16 @@ class AgentDialog(QtWidgets.QDialog):
         self.chat = AgentChatWidget(self)
         lay.addWidget(self.chat, stretch=1)
 
-        self._on_protocol_changed()
+        # Initial placeholder / label setup — always driven by the
+        # Backend combobox (which itself defaults to Anthropic (cloud)
+        # until _restore_settings picks the saved backend).
+        self._on_backend_changed()
 
     def _on_protocol_changed(self):
+        # Called when the user tweaks the Protocol combobox directly
+        # (independent of the Backend preset). Only refresh the URL
+        # placeholder to match the raw protocol; leave the Backend
+        # combobox alone so the user's explicit choice isn't reset.
         proto = self._current_protocol()
         if proto == PROTOCOL_ANTHROPIC:
             self.url_edit.setPlaceholderText(
@@ -1361,6 +1452,46 @@ class AgentDialog(QtWidgets.QDialog):
                 "https://gateway.example.com/v1 (OpenAI)"
             )
 
+    def _current_backend(self) -> str:
+        """Backend id currently selected in the Backend combobox."""
+        return self.backend_combo.currentData() or BACKEND_ANTHROPIC
+
+    def _on_backend_changed(self):
+        """Update Protocol + URL placeholder + API-key hint from the
+        selected preset. Does NOT clear whatever the user has already
+        typed — placeholders are cosmetic; existing text stays."""
+        bid = self._current_backend()
+        preset = next((p for p in BACKEND_PRESETS if p[0] == bid), None)
+        if preset is None:
+            return
+        _, _label, proto, placeholder, needs_key = preset
+
+        # Sync the Protocol combo to the backend's protocol without
+        # letting _on_protocol_changed re-clobber the URL placeholder
+        # we're about to set.
+        idx = self.protocol_combo.findData(proto)
+        if idx >= 0 and self.protocol_combo.currentIndex() != idx:
+            self.protocol_combo.blockSignals(True)
+            self.protocol_combo.setCurrentIndex(idx)
+            self.protocol_combo.blockSignals(False)
+
+        self.url_edit.setPlaceholderText(placeholder)
+
+        if needs_key:
+            self.key_edit.setPlaceholderText("required for cloud gateway")
+            self.key_edit.setToolTip(
+                "Cloud API key. Saved locally in "
+                "~/.pystream/agent_settings.json (user-only file; not "
+                "in any git repo).")
+        else:
+            self.key_edit.setPlaceholderText(
+                "leave blank for local runners; a sentinel is sent "
+                "automatically")
+            self.key_edit.setToolTip(
+                "Local runners (Ollama, llama.cpp, vLLM, LM Studio) "
+                "ignore the API key. If your runner does require one, "
+                "enter it here — otherwise leave blank.")
+
     def _current_protocol(self) -> str:
         return self.protocol_combo.currentData() or PROTOCOL_ANTHROPIC
 
@@ -1368,9 +1499,13 @@ class AgentDialog(QtWidgets.QDialog):
     def _refresh_models(self):
         url = self.url_edit.text().strip()
         key = self.key_edit.text().strip()
-        if not url or not key:
-            self._set_conn_status("set URL and API key first", error=True)
+        if not url:
+            self._set_conn_status("set URL first", error=True)
             return
+        # Key is optional for local backends (`_list_models` will
+        # substitute a sentinel via `_resolve_api_key`). For the two
+        # cloud backends, warn but don't block — the server itself
+        # will 401 and the user will see the error inline.
         proto = self._current_protocol()
         self._set_conn_status("connecting…", error=False)
         QtWidgets.QApplication.processEvents()
@@ -1407,6 +1542,16 @@ class AgentDialog(QtWidgets.QDialog):
         s = load_settings()
         if not s:
             return
+        # Backend first — it drives placeholders + key hint via
+        # _on_backend_changed. Silence the signal while we set it so
+        # user text isn't overwritten by placeholder logic before
+        # url_edit / key_edit get populated below.
+        backend = _backend_from_settings(s)
+        bidx = self.backend_combo.findData(backend)
+        if bidx >= 0:
+            self.backend_combo.blockSignals(True)
+            self.backend_combo.setCurrentIndex(bidx)
+            self.backend_combo.blockSignals(False)
         proto = s.get("protocol", PROTOCOL_ANTHROPIC)
         idx = self.protocol_combo.findData(proto)
         if idx >= 0:
@@ -1414,6 +1559,9 @@ class AgentDialog(QtWidgets.QDialog):
         self.name_edit.setText(s.get("agent_name", ""))
         self.url_edit.setText(s.get("base_url", ""))
         self.key_edit.setText(s.get("api_key", ""))
+        # Now that url/key are populated, sync the cosmetic bits
+        # (placeholders + key hint) to the restored backend.
+        self._on_backend_changed()
         sp = s.get("system_prompt")
         if sp:
             self.system_edit.setPlainText(sp)
@@ -1425,6 +1573,7 @@ class AgentDialog(QtWidgets.QDialog):
 
     def _persist_settings(self):
         save_settings({
+            "backend": self._current_backend(),
             "protocol": self._current_protocol(),
             "agent_name": self.name_edit.text().strip(),
             "base_url": self.url_edit.text(),

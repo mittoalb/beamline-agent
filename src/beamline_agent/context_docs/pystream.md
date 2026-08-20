@@ -139,7 +139,7 @@ system prompt. Both files ship inside the pystream package.
 |---|---|
 | `agent_settings.json` | Your protocol / URL / API key / model / prompt overrides |
 | `agent_history_dock.json` | Persistent chat history (your transcript with the user) |
-| `docs/*.md` | Instruction files the agent reads. **`pystream.md` is THIS file**; `tomogui.md` is the reconstruction sub-agent's prompt; `bl_gui.md` documents `bl-cli` for headless motor / layout / energy operations on bl32ID; `xanes_gui.md` documents `xanes-cli`; user notes may also live here. |
+| `docs/*.md` | Instruction files the agent reads. **`pystream.md` is THIS file**; `tomogui.md` is the reconstruction sub-agent's prompt; `bl_gui.md` documents `bl-cli` for headless motor / layout / energy operations on bl32ID; `xanes_gui.md` documents `xanes-cli`; `local_models.md` covers switching between a cloud API and a self-hosted model; user notes may also live here. |
 | `task_recordings/` | Task Recorder sessions |
 | `task_contexts.json`, `task_tools.json` | Task Recorder per-task edits + published tools |
 | `bl32ID_settings.json`, `pv_aliases.json`, `ioc_scripts.json`, `status_pages.json` | Beamline / plugin config the user maintains |
