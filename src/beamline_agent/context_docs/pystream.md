@@ -41,7 +41,7 @@ doc is describing the maximum-possible set, not your specific set.
 | `view_image(path)` | **Opens pystream's built-in image viewer (agent-only, no toolbar button)** on any PNG / JPG / TIFF / NPY / other on-disk image. Use for ANY "show me" / "view" / "display" request on a non-HDF5 image — matplotlib plot PNGs, TIFF slices, agent-produced graphs. Handles single-frame + stacks (multi-page TIFF, 3D NPY get a slider). **Prefer over telling the user to `xdg-open` the file.** File must be on local FS — scp remote files first. |
 | `view_hdf5_file(path)` | **Opens pystream's embedded HDF5 viewer** on a local file. Use for HDF5 specifically — reconstruction output (`_rec.h5`), source projection stacks, plain 3D volumes. Auto-detects raw-tomo vs recon layout. Do NOT hand-roll `python -c "import h5py..."`, do NOT tell the user you can't view HDF5. For non-HDF5 images use `view_image` above. |
 | `spawn_subagent(kind, task)` | Delegate a specialized task to a purpose-built sub-agent. Currently supports `kind="reconstruction"` (drives tomogui-cli). See `~/.pystream/docs/tomogui.md` for the reconstruction sub-agent's contract. |
-| `save_learned_note(topic, content, tool="general")` | Persist a durable note to `_learned.md` in the pystream source tree so the user can `git diff` + commit + push. Call when you discover something worth remembering across sessions. |
+| `save_learned_note(topic, content, tool="general")` | Persist a durable note to `~/.pystream/_learned.md` (per-user, local, NOT tracked in git — the user backs it up separately). Call when you discover something worth remembering across sessions. |
 | `list_task_recordings()` | Enumerate every recorded beamline task in `~/.pystream/task_recordings/` — alignment procedures, sample positioning, scan setup, etc. Call FIRST when the user asks how to perform any repeatable beamline procedure. |
 | `read_task_recording(task_slug, session_id=None)` | Load a specific task recording — motor moves, before/after frames, notes. Use after `list_task_recordings` to actually see the procedure. |
 
@@ -159,9 +159,10 @@ the same user account.
 3. **"Read this PV" / "what's motor Z at?"** → `read_pv` (or `read_file` if it's a PV alias name — check `pv_aliases.json`).
 4. **"How do I align element E?"** → `list_task_recordings()` first; if a recording exists, `read_task_recording(slug)`; if not, say so and suggest recording one.
 5. **"What motors are on 32-ID?" / "move motor X" / "set energy to N keV" (32-ID)** → `bash: bl-cli ... --json`. See `~/.pystream/docs/bl_gui.md`. Prefer `bl-cli energy set <keV>` over raw caput to the energy PV — it uses the ZP calibration and moves every coordinated motor. Any motor move is a write: expect the caput confirmation dialog. For multi-step sequences, delegate to the `beamline_operator` sub-agent instead.
-6. **"Reconstruct X on tomo2" / anything tomogui** → `spawn_subagent("reconstruction", task=...)`. DO NOT SSH tomo2 yourself.
-7. **"Where does file Y live?" / config questions** → `bash: ls`, `read_file`, or check the paths in this doc.
-8. **User teaches you something worth keeping** → `save_learned_note(topic, content, tool="…")` so the user can `git diff` + commit it.
+6. **"Plot me / compute the attenuation / transmission / refractive index / cross-section of X at N keV"** → `spawn_subagent("physicist", task=...)`. Physicist has xraylib + numpy + matplotlib in `bash`, produces a `/tmp/*.png`, returns the path. Then YOU call `view_image(<path>)` to show it to the user. Do NOT reply "I don't have a plotting tool" — you have `spawn_subagent` + `view_image`.
+7. **"Reconstruct X on tomo2" / anything tomogui** → `spawn_subagent("reconstruction", task=...)`. DO NOT SSH tomo2 yourself.
+8. **"Where does file Y live?" / config questions** → `bash: ls`, `read_file`, or check the paths in this doc.
+9. **User teaches you something worth keeping** → `save_learned_note(topic, content, tool="…")` so the user can `git diff` + commit it.
 
 ## What NOT to do
 

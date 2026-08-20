@@ -31,61 +31,7 @@ TASK_RECORDINGS_ROOT = os.path.join(PYSTREAM_HOME, "task_recordings")
 # checkout isn't detected (fresh pip install on a different machine).
 # Notes there DO NOT get committed to git — the user will need to
 # manually copy anything useful into the source tree.
-LEARNED_NOTES_FALLBACK = os.path.join(PYSTREAM_HOME, "learned_notes.md")
-
-
-def _find_source_docs_dir() -> str | None:
-    """Return the source-tree `agent/context_docs/` path where the
-    agent should append learned notes so `git diff` picks them up.
-    Returns None only if no plausible checkout exists on this machine
-    (fresh pip install with no local clone).
-
-    Detection order:
-      1. Walk up from `beamline_agent/__init__.py` — catches editable
-         installs (`pip install -e`) where the package lives inside
-         the git checkout.
-      2. Optional config override in `agent_settings.json["docs_write_root"]`
-         — advanced users can point elsewhere.
-      3. Convention: `~/Software/beamline-agent/` if it has a `.git`.
-         Matches the standard deploy layout on the beamline hosts."""
-    # 1. Editable-install case
-    try:
-        import beamline_agent
-        pkg = os.path.dirname(os.path.abspath(beamline_agent.__file__))
-        d = pkg
-        for _ in range(6):
-            if os.path.isdir(os.path.join(d, ".git")):
-                candidate = os.path.join(d, "src", "beamline_agent", "context_docs")
-                if os.path.isdir(candidate):
-                    return candidate
-                break
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-    except Exception:
-        pass
-
-    # 2. Explicit override from agent settings
-    try:
-        settings_path = os.path.join(PYSTREAM_HOME, "agent_settings.json")
-        if os.path.isfile(settings_path):
-            with open(settings_path) as f:
-                cfg = json.load(f)
-            override = cfg.get("docs_write_root") if isinstance(cfg, dict) else None
-            if override and os.path.isdir(override):
-                return override
-    except Exception:
-        pass
-
-    # 3. Convention: ~/Software/beamline-agent (standard deploy layout).
-    convention = os.path.expanduser(
-        "~/Software/beamline-agent/src/beamline_agent/context_docs")
-    if (os.path.isdir(convention)
-            and os.path.isdir(os.path.expanduser("~/Software/beamline-agent/.git"))):
-        return convention
-
-    return None
+LEARNED_NOTES_PATH = os.path.join(PYSTREAM_HOME, "_learned.md")
 
 
 # ── low-level helpers ───────────────────────────────────────────────────
@@ -159,17 +105,16 @@ def tool_list_task_recordings() -> dict:
 def tool_save_learned_note(topic: str, content: str,
                             tool: str = "general") -> dict:
     """Append a durable note to the agent's own knowledge file, for
-    future turns AND future users to benefit from. Called when the
-    agent discovers something worth remembering: a new CLI flag, a
-    corrected file path, a machine's shell quirk, a failure mode +
-    workaround, a PV that behaves differently than documented.
+    future turns to benefit from. Called when the agent discovers
+    something worth remembering: a new CLI flag, a corrected file
+    path, a machine's shell quirk, a failure mode + workaround, a PV
+    that behaves differently than documented.
 
-    Writes to the pystream source tree if the checkout is detected
-    (`src/pystream/agent/context_docs/_learned.md`) so the user can
-    `git diff` + review + commit — that's the whole point. If we're
-    running from a regular pip install (no checkout), falls back to
-    `~/.pystream/learned_notes.md` (personal, per-machine) and reports
-    that in the return value so the user knows their notes stay local.
+    Writes to `~/.pystream/_learned.md` (per-user, local, NOT tracked
+    in the beamline-agent repo). The user backs this file up out of
+    band — the notes are personal knowledge, not something to push to
+    a shared source tree. If a note is broadly useful, a human
+    reviewer promotes it into a curated `context_docs/*.md` file.
 
     `tool` — short slug for what the note pertains to ("tomogui",
     "bl_gui", "conda", "ssh", "general"). Used to group entries when
@@ -183,15 +128,7 @@ def tool_save_learned_note(topic: str, content: str,
         return {"error": "topic is required"}
     if not content or not content.strip():
         return {"error": "content is required"}
-    src_dir = _find_source_docs_dir()
-    if src_dir:
-        path = os.path.join(src_dir, "_learned.md")
-        deploy = "source-tree (will show up in git diff — commit + push to share)"
-    else:
-        path = LEARNED_NOTES_FALLBACK
-        deploy = ("personal (no pystream source checkout detected — "
-                  "notes stay on this machine only; copy the useful ones "
-                  "into your source tree if you want to share)")
+    path = LEARNED_NOTES_PATH
     ts = datetime.now().isoformat(timespec="seconds")
     entry = (f"\n## [{tool}] {topic.strip()}   ({ts})\n\n"
              f"{content.strip()}\n\n---\n")
@@ -203,13 +140,15 @@ def tool_save_learned_note(topic: str, content: str,
         with open(path, "a") as f:
             if is_new:
                 f.write("# Agent-learned notes\n\n"
-                        "Auto-appended by the pystream AI agent via "
-                        "`save_learned_note`. Review, promote to a "
-                        "curated tool doc if useful, then delete the "
-                        "entry from here.\n\n")
+                        "Auto-appended by the AI agent via "
+                        "`save_learned_note`. Local to this user "
+                        "(not in git). Review, promote broadly-"
+                        "useful entries into a curated doc, then "
+                        "delete the entry from here.\n\n")
             f.write(entry)
         return {"ok": True, "path": path, "bytes_added": len(entry),
-                "deployment": deploy}
+                "deployment": "personal (~/.pystream/_learned.md — "
+                              "not tracked in git; back up separately)"}
     except OSError as ex:
         return {"error": f"cannot write {path}: {ex}"}
 
@@ -556,14 +495,13 @@ CORE_TOOLS: list[dict[str, Any]] = [
         "name": "save_learned_note",
         "description": (
             "Append a durable note to the agent's own knowledge file "
-            "for future turns AND future users. Call when you discover "
-            "something worth remembering across sessions: a new CLI "
-            "flag, a corrected path, a shell quirk on a specific "
-            "machine, a failure workaround, or any insight about a tool "
-            "that isn't already in `~/.pystream/docs/<tool>.md`. "
-            "Writes to the pystream source tree if this is a dev "
-            "checkout so the user can git diff + commit — otherwise "
-            "to a personal file (still useful, just not auto-shared). "
+            "for future turns. Call when you discover something worth "
+            "remembering across sessions: a new CLI flag, a corrected "
+            "path, a shell quirk on a specific machine, a failure "
+            "workaround, or any insight about a tool that isn't "
+            "already in `~/.pystream/docs/<tool>.md`. "
+            "Writes to `~/.pystream/_learned.md` — per-user, local, "
+            "NOT tracked in git. The user backs it up separately."
             "\n\n"
             "DO NOT call for things the user already told you this "
             "turn — chat history handles that. Call ONLY for findings "
@@ -694,8 +632,16 @@ or from context.
 - **physicist** — deep physics Q about x-ray optics, tomography
   physics, matter interactions, diffraction, coherence, detector
   physics. Trigger on questions with formulas, "why", "explain the
-  regime where...", or anything the user asks that needs derivation
-  rather than a PV read.
+  regime where...", anything the user asks that needs derivation
+  rather than a PV read. **ALSO trigger on compute-a-physical-
+  quantity requests: "plot me the attenuation / transmission /
+  refractive index / delta / beta / cross-section / density of X",
+  "what's μ/ρ of Y at Z keV", "generate the absorption spectrum
+  of ...". The physicist has `bash` + xraylib + numpy + matplotlib
+  and produces PNG plots you then hand to the user via
+  `view_image(path)`.** Do NOT tell the user "I don't have a
+  plotting tool" — you have `spawn_subagent("physicist", ...)`
+  followed by `view_image`.
 - **chemist** — XANES / EXAFS interpretation, absorption-edge ID,
   composition inference from x-ray data, sample-chemistry questions.
   Trigger on "what element", "what oxidation state", "identify this
@@ -728,6 +674,52 @@ the sub-agent already tried with the specialist prompt. Also don't
 immediately spawn a second one with a "corrected" prompt — first
 ask the user what to do differently.
 
+# NEVER REFUSE A TASK BY CLAIMING A CAPABILITY DOESN'T EXIST
+
+Before you type "I don't have a tool for that" / "that's outside my
+toolset" / "I can't do X" — STOP. Run the mental check:
+
+1. **Is there a subagent kind that covers it?**  Motor moves, plugin
+   sequences, multi-step ops → `beamline_operator`. Physics compute
+   / plots / xraylib → `physicist`. XANES / EXAFS / edge ID /
+   chemistry → `chemist`. Tomo recon → `reconstruction`.
+2. **Can I compose my existing tools?**  `bash` + `view_image`
+   handles ANY "plot X" or "show me the output of Y" request:
+   subagent writes a PNG, you `view_image` it. `bash: bl-cli …`
+   handles ANY 32-ID motor / layout / energy operation. `bash:
+   <arbitrary python>` handles ANY compute the env can run
+   (numpy, scipy, xraylib, matplotlib, h5py, tifffile).
+3. **Would `bash` with a longer timeout do it?**  Fetch some data,
+   run a script, install a small pip dep to `~/.local`, invoke a
+   shell tool. `bash` is a general-purpose escape hatch.
+
+Only after all three come back "no" is it appropriate to tell the
+user "I can't do that here." And when you do, name what specifically
+is missing (module not in env, PV not registered, subagent kind
+missing) so the user can fix it — don't just wave your hands.
+
+Concrete examples of things you MIGHT be tempted to refuse but
+should NOT:
+
+- "Plot me the attenuation of Si between 5 and 20 keV" →
+  `spawn_subagent("physicist", task="...")`, then
+  `view_image(returned_path)`.
+- "Move motor X by 1 µm on 32-ID" → `bash: bl-cli motor set ...`.
+- "Reconstruct sample Y on tomo2" → `spawn_subagent("reconstruction",
+  task="...")`.
+- "What element is at this XANES edge?" → `spawn_subagent("chemist",
+  task="...")`.
+- "Show me this HDF5 file" → `view_hdf5_file(path)`.
+- "Convert this TIFF to PNG / compute stats on this array" → `bash:
+  python -c 'import tifffile, numpy as np; ...'`.
+- "Fetch this vendor page and summarise" → `fetch_url(...)`.
+
+If you're unsure whether a subagent kind exists, ASSUME IT DOES for
+common tasks (physicist / chemist / reconstruction / beamline_operator
+all exist today) and try `spawn_subagent`. The tool will error if the
+kind is bad; then you tell the user. "I don't have that tool" without
+even attempting is the failure mode this section exists to prevent.
+
 # TOOL BUDGET DISCIPLINE
 
 You get ~10 tool rounds per turn. Spend them on ACTION, not
@@ -754,9 +746,10 @@ CLI flag that isn't documented, a machine's shell quirk (`tomo2` uses
 tcsh, so `conda run` needs `bash -lc`), a workaround for a recurring
 failure, a corrected file path, an insight about how a tool actually
 behaves — call `save_learned_note(topic, content, tool="…")`. The
-note lands in the pystream source tree's `_learned.md` so the user
-can `git diff` + review + commit + push. Future turns AND other users
-who pull the repo benefit.
+note lands in `~/.pystream/_learned.md` — per-user, local to this
+machine, NOT tracked by git. The user backs that file up out of band.
+Future turns of yours (and other agents on this account) will read it
+at startup.
 
 Do NOT save:
 - Anything the user already told you this turn (history handles it)
