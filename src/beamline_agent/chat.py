@@ -23,10 +23,13 @@ Configuration + history persist under ~/.pystream/ :
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import pyqtSignal
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ── Storage locations ──────────────────────────────────────────────────
@@ -578,6 +581,155 @@ def _openai_tool_result_text(result):
     return json.dumps(result, default=str)
 
 
+# ── hallucination detector ─────────────────────────────────────────────
+#
+# LIVE INCIDENT 2026-08-20: on repeated motor-move requests, models
+# were returning text-only replies ("Both at 1.0000, DMOV=1", "caput
+# fired", "verified via RBV") without emitting ANY tool_call in the
+# turn. The user saw no confirmation dialog, the motors didn't move,
+# and the transcript filled with fake successes. This detector runs
+# at the point the loop would exit, catches the fabrication, and
+# forces one more iteration with a corrective message telling the
+# model to actually invoke the tool.
+#
+# Two conditions must be true:
+#   1. The USER's original message asks for an ACTION (imperative
+#      verb like move / set / put / caput / write / run / fire).
+#   2. The MODEL's reply CLAIMS an action (past-tense verb like
+#      moved / fired / wrote / set / caput'd / done, or a
+#      verification claim like DMOV=1 / RBV=N / verified).
+# AND: the whole turn's tool_call count is zero.
+#
+# The correction message tells the model, plainly, that its previous
+# reply was hallucinated. We allow up to `HALLUCINATION_MAX_RETRIES`
+# corrections per turn; beyond that we surface a hard error rather
+# than let the model spin.
+
+HALLUCINATION_MAX_RETRIES = 2
+
+_USER_ACTION_RE = re.compile(
+    r"\b("
+    r"move|set|put|go(?:\s+to)?|caput|write|run|fire|send|drive|"
+    r"restart|open|close|start|stop|trigger|reset|"
+    r"back\s+to|to\s+[\-+0-9]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Weak claims — past-tense verbs that could appear in a legit reply
+# ("moved successfully to 1.0" AFTER a real caput). Require a numeric
+# value or explicit completion phrase so we don't false-positive on
+# educational replies like "you call caput to set a PV".
+_MODEL_CLAIM_WEAK_RE = re.compile(
+    r"\b("
+    r"moved\s+to\s+[\-+0-9]|set\s+to\s+[\-+0-9]|"
+    r"(?:already|now)\s+at\s+[\-+0-9.eE]+|"
+    r"done(?:\.|\s|$)|"
+    r"executed|complete(?:d)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Strong claims — phrases the model only produces when it's
+# fabricating a tool-call report. These trigger detection ALONE,
+# without needing an action verb in the user's message. Legit
+# replies never contain these unless a tool actually ran.
+_MODEL_CLAIM_STRONG_RE = re.compile(
+    r"("
+    r"\bcaput(?:s|ed|ted|'d)?\s+(?:fired|firing|written|sent|"
+    r"succeeded|OK|done|this\s+turn)|"
+    r"\bfired?\s+(?:the\s+)?caput|"
+    r"\bfired\s+both\b|"
+    r"\bfiring\s+caputs?|"
+    r"\bwrote\s+to\b|"
+    r"\bverified\s+(?:via|after|with)\s+(?:rbv|caput)|"
+    r"\bverified\s+by\s+rbv|"
+    r"\brbv\s+verified|"
+    r"\bdmov\s*=\s*1|"
+    r"\brbv\s*=|"
+    r"\battempts?\s+succeeded|"
+    r"\bmove\s+(?:issued|fired|committed)|"
+    r"\bboth\s+at\s+[\-+0-9]|"
+    # Infrastructure fabrication — hostnames, gateways, IPs,
+    # architecture claims the model invents to explain away a
+    # missing tool call. Live incident 2026-08-20: "Host:
+    # `hulk.aps.anl.gov`. EPICS gateway: `s32dserv2.xray.aps.anl.gov:5064`"
+    # was reported without any `bash: hostname` call.
+    r"\b(?:host|hostname)\s*(?::|is|=)\s*[a-z0-9][a-z0-9.\-]*|"
+    r"\bepics[\s_]*gateway\s*(?::|=)|"
+    r"\bca[\s_]*gateway\s*(?::|=)|"
+    r"\b(?:runs?|running)\s+on\s+[a-z][a-z0-9.\-]*(?:\.aps\.anl\.gov)?|"
+    r"\bsshes?\s+(?:in)?to\s+[a-z]|"
+    r"\bsplit\s+architecture|"
+    r"\bagent\s+(?:runtime|backend)\s+(?:on|is\s+on)\s+[a-z]"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_action_hallucination(user_text: str,
+                              reply_text: str,
+                              tools_called_this_turn: int) -> bool:
+    """Return True when the model returned an action-claim reply
+    without having invoked any tool this turn.
+
+    Detection has two tiers:
+      * STRONG claim — the reply contains a phrase the model only
+        produces when fabricating a tool-call report ("caput fired",
+        "DMOV=1", "verified via RBV", "Both at 1.0"). Triggers alone.
+      * WEAK claim — a general past-tense verb ("moved to 1", "done")
+        that could appear in a legit reply. Requires the user's own
+        message to have implied an action too."""
+    if tools_called_this_turn > 0:
+        return False
+    if not reply_text:
+        return False
+    # Strong claims trigger regardless of the user's phrasing —
+    # legit replies to non-action questions don't contain them.
+    if _MODEL_CLAIM_STRONG_RE.search(reply_text):
+        return True
+    # Weak claims need a matching user-side action verb.
+    if not _USER_ACTION_RE.search(user_text or ""):
+        return False
+    return bool(_MODEL_CLAIM_WEAK_RE.search(reply_text))
+
+
+_HALLUCINATION_CORRECTION = (
+    "AGENT-LOOP GUARD: Your previous reply claims an action was "
+    "performed (\"{claim_snippet}\") but you did NOT invoke any "
+    "tool this turn. Text-only replies do nothing on this system — "
+    "the beamline / motor / plot / file only changes when you emit "
+    "a tool_call. This is not a permission or config problem; it "
+    "is a hallucination pattern seen in your reply. RETRY NOW: "
+    "call the appropriate tool (caput / bash / open_beamline_plugin "
+    "/ etc.) BEFORE writing any text. Do not include the words "
+    "\"done\", \"fired\", \"verified\", or similar until AFTER you "
+    "receive a tool_result confirming success. If your claim was "
+    "about infrastructure (hostname, host, EPICS gateway, "
+    "\"runs on X\", \"SSHes to Y\"), you fabricated it — the only "
+    "way to know a hostname is `bash: hostname`, an EPICS gateway "
+    "is `bash: echo $EPICS_CA_ADDR_LIST`, etc. Call the tool."
+)
+
+_HALLUCINATION_BANNER = (
+    "⚠️ AGENT-LOOP GUARD: the reply below was flagged as a "
+    "hallucination — the model claimed an action but did not "
+    "actually invoke any tool. The claim may be false. Nothing "
+    "was written to the beamline, no file was produced, no PV "
+    "was changed. Re-issue your request or check the Console for "
+    "actual tool activity this turn."
+)
+
+
+def _hallucination_snippet(reply_text: str, limit: int = 80) -> str:
+    """Trim a reply for the correction message so we don't feed the
+    whole hallucinated paragraph back to the model."""
+    t = (reply_text or "").strip().replace("\n", " ")
+    if len(t) <= limit:
+        return t
+    return t[:limit] + "…"
+
+
 # ── chat: Anthropic protocol ────────────────────────────────────────────
 
 def _chat_anthropic(base_url, api_key, model, system_prompt,
@@ -592,6 +744,8 @@ def _chat_anthropic(base_url, api_key, model, system_prompt,
     messages = [*history, {"role": "user", "content": user_text}]
 
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    tools_called_this_turn = 0    # for the hallucination detector
+    hallucination_retries = 0
 
     for _ in range(MAX_AGENT_ITERATIONS):
         response = client.messages.create(
@@ -616,6 +770,34 @@ def _chat_anthropic(base_url, api_key, model, system_prompt,
                 b.text for b in response.content
                 if getattr(b, "type", None) == "text"
             ).strip()
+
+            # Hallucination guard — see the section-header comment above
+            # `_is_action_hallucination` for the incident this fixes.
+            if _is_action_hallucination(
+                    user_text, text, tools_called_this_turn):
+                if hallucination_retries < HALLUCINATION_MAX_RETRIES:
+                    hallucination_retries += 1
+                    LOGGER.warning(
+                        "hallucinated action reply (retry %d/%d): %r",
+                        hallucination_retries, HALLUCINATION_MAX_RETRIES,
+                        text[:120])
+                    # Feed the model back a user-role correction. Anthropic
+                    # models handle a plain user message here; the previous
+                    # assistant text stays in-context so the model can see
+                    # what it claimed vs. what it should have done.
+                    messages.append({"role": "assistant",
+                                      "content": response.content})
+                    messages.append({"role": "user", "content":
+                        _HALLUCINATION_CORRECTION.format(
+                            claim_snippet=_hallucination_snippet(text))})
+                    continue
+                # Retries exhausted — prepend a clear warning so the
+                # user sees "this reply is fabricated" instead of
+                # trusting the fake success message.
+                LOGGER.error("hallucination guard exhausted; delivering "
+                             "reply with warning banner: %r", text[:120])
+                return _HALLUCINATION_BANNER + "\n\n" + text, totals
+
             return text, totals
 
         # Append the assistant's content (text + tool_use blocks) verbatim,
@@ -624,6 +806,7 @@ def _chat_anthropic(base_url, api_key, model, system_prompt,
         tool_results = []
         for b in response.content:
             if getattr(b, "type", None) == "tool_use":
+                tools_called_this_turn += 1
                 emit_tool(b.name, b.input, None)
                 result = _execute_tool(b.name, b.input, tool_ctx, confirm=confirm)
                 emit_tool(b.name, b.input, result)
@@ -657,6 +840,8 @@ def _chat_openai(base_url, api_key, model, system_prompt,
         {"role": "user", "content": user_text},
     ]
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    tools_called_this_turn = 0
+    hallucination_retries = 0
 
     for _ in range(MAX_AGENT_ITERATIONS):
         response = client.chat.completions.create(
@@ -670,7 +855,25 @@ def _chat_openai(base_url, api_key, model, system_prompt,
 
         msg = response.choices[0].message
         if not msg.tool_calls:
-            return (msg.content or "").strip(), totals
+            text = (msg.content or "").strip()
+            # Hallucination guard — mirror of the Anthropic path above.
+            if _is_action_hallucination(
+                    user_text, text, tools_called_this_turn):
+                if hallucination_retries < HALLUCINATION_MAX_RETRIES:
+                    hallucination_retries += 1
+                    LOGGER.warning(
+                        "hallucinated action reply (retry %d/%d): %r",
+                        hallucination_retries, HALLUCINATION_MAX_RETRIES,
+                        text[:120])
+                    messages.append({"role": "assistant", "content": text})
+                    messages.append({"role": "user", "content":
+                        _HALLUCINATION_CORRECTION.format(
+                            claim_snippet=_hallucination_snippet(text))})
+                    continue
+                LOGGER.error("hallucination guard exhausted; delivering "
+                             "reply with warning banner: %r", text[:120])
+                return _HALLUCINATION_BANNER + "\n\n" + text, totals
+            return text, totals
 
         # Re-attach the assistant turn including its tool_calls, then send
         # one tool message per call.
@@ -686,6 +889,7 @@ def _chat_openai(base_url, api_key, model, system_prompt,
                 },
             } for tc in msg.tool_calls],
         })
+        tools_called_this_turn += len(msg.tool_calls)
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
