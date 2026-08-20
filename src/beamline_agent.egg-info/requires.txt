@@ -1,0 +1,16 @@
+PyQt5>=5.15
+numpy>=1.20
+Pillow>=9.0
+pyqtgraph>=0.13
+anthropic>=0.40
+openai>=1.0
+h5py>=3.0
+tifffile>=2023.0
+
+[dev]
+pytest>=7
+pytest-qt>=4
+
+[epics]
+pyepics>=3.5
+pvapy

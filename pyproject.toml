@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamline-agent"
+version = "0.1.0"
+description = "AI-agent chat, sub-agent dispatch, live-status registry, and image viewers for APS beamline tools. Hosted in-process by pystream today; pluggable into any Qt app via HostContext."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Alberto Mittone", email = "amittone@anl.gov"}
+]
+keywords = ["aps", "beamline", "ai", "agent", "anthropic", "pystream"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: X11 Applications :: Qt",
+    "Framework :: Qt",
+]
+
+# Runtime deps — everything the agent code + tools + viewers need.
+dependencies = [
+    "PyQt5>=5.15",
+    "numpy>=1.20",
+    "Pillow>=9.0",
+    "pyqtgraph>=0.13",
+    "anthropic>=0.40",       # main LLM protocol
+    "openai>=1.0",           # optional protocol
+    "h5py>=3.0",             # HDF5 viewer + task recorder
+    "tifffile>=2023.0",      # image viewer + task recorder frames
+]
+
+[project.optional-dependencies]
+epics = [
+    "pyepics>=3.5",          # for beamline-provided caget/caput tools
+    "pvapy",                 # for PVA detector streams
+]
+dev = [
+    "pytest>=7",
+    "pytest-qt>=4",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["beamline_agent*"]
+
+[tool.setuptools.package-data]
+beamline_agent = ["context_docs/*.md"]

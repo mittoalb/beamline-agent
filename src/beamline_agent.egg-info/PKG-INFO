@@ -1,0 +1,104 @@
+Metadata-Version: 2.4
+Name: beamline-agent
+Version: 0.1.0
+Summary: AI-agent chat, sub-agent dispatch, live-status registry, and image viewers for APS beamline tools. Hosted in-process by pystream today; pluggable into any Qt app via HostContext.
+Author-email: Alberto Mittone <amittone@anl.gov>
+License: MIT
+Keywords: aps,beamline,ai,agent,anthropic,pystream
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Environment :: X11 Applications :: Qt
+Classifier: Framework :: Qt
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: PyQt5>=5.15
+Requires-Dist: numpy>=1.20
+Requires-Dist: Pillow>=9.0
+Requires-Dist: pyqtgraph>=0.13
+Requires-Dist: anthropic>=0.40
+Requires-Dist: openai>=1.0
+Requires-Dist: h5py>=3.0
+Requires-Dist: tifffile>=2023.0
+Provides-Extra: epics
+Requires-Dist: pyepics>=3.5; extra == "epics"
+Requires-Dist: pvapy; extra == "epics"
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: pytest-qt>=4; extra == "dev"
+
+# beamline-agent
+
+AI-agent chat + sub-agent dispatch + status monitor + image viewers for
+APS beamline tools. Currently hosted in-process by
+[pystream](https://github.com/mittoalb/pystream) — pluggable into any
+Qt app via the `HostContext` protocol.
+
+## What's inside
+
+- **Chat panel** — the pystream "AI Agent" dock; talks to Anthropic or
+  OpenAI, with tool-use loop + parallel turns + persistent history.
+- **Sub-agent dispatch** — `spawn_subagent(kind, task)` delegates to
+  specialists (reconstruction, physicist, chemist, beamline_operator).
+- **Agents panel** — live tree of every AI agent process running on the
+  beamline (main + spawned sub-agents + cross-machine workers).
+- **Console** — wire trace of every tool call + result, with an
+  in-flight timer for long-running work.
+- **Image viewer** — agent-only PNG/TIFF/NPY viewer (no toolbar
+  button; the agent calls `view_image(path)`).
+- **HDF5 viewer helper** — same for `.h5` files (via the host).
+- **Task recorder** — captures motor sequences + detector frames so
+  the agent can replay them later.
+- **Learned-note store** — `save_learned_note` writes to the
+  package's git checkout so notes propagate on `git pull`.
+- **Instruction docs** (`context_docs/*.md`) ship inside the package
+  and auto-deploy to `~/.pystream/docs/` on first launch.
+
+## Install
+
+```bash
+pip install beamline-agent
+```
+
+Or from source:
+
+```bash
+git clone <this-repo>
+cd beamline-agent
+pip install -e .
+```
+
+## Use from pystream (the current primary host)
+
+pystream lists `beamline-agent` as an optional dep. Install both and the
+"AI Agent" dock, `👥 Agents`, `📜 Console`, and `🎥 Task Rec` buttons
+appear in pystream automatically. Don't install `beamline-agent` and
+pystream keeps working — just without those buttons.
+
+## Use from another Qt app
+
+```python
+from beamline_agent import mount, HostContext
+
+class MyApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        ...  # your normal main window setup
+        host = HostContext(
+            main_window       = self,
+            live_frame        = lambda: self.get_current_frame(),
+            frame_signal      = self.new_frame,          # pyqtSignal(np.ndarray)
+            open_hdf5_viewer  = self._open_hdf5,
+            open_plugin       = self._open_my_plugin,
+            active_beamline   = "bl32ID",
+        )
+        mount(host)   # adds the chat dock + toolbar buttons to `self`
+```
+
+The `HostContext` protocol lets the agent use whatever the host offers
+and gracefully degrade for anything absent (a host that doesn't provide
+`live_frame` just won't have the live-image tool in the catalog).
