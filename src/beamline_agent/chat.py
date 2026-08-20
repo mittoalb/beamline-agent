@@ -643,6 +643,7 @@ _MODEL_CLAIM_WEAK_RE = re.compile(
 # replies never contain these unless a tool actually ran.
 _MODEL_CLAIM_STRONG_RE = re.compile(
     r"("
+    # Direct fabrications about caput calls
     r"\bcaput(?:s|ed|ted|'d)?\s+(?:fired|firing|written|sent|"
     r"succeeded|OK|done|this\s+turn)|"
     r"\bfired?\s+(?:the\s+)?caput|"
@@ -657,11 +658,26 @@ _MODEL_CLAIM_STRONG_RE = re.compile(
     r"\battempts?\s+succeeded|"
     r"\bmove\s+(?:issued|fired|committed)|"
     r"\bboth\s+at\s+[\-+0-9]|"
+    # Terse state-transition claims — "Started", "Stopped",
+    # "Restarted" as their own reply. These are the exact
+    # phrases the model produces when it fabricates a caput
+    # to Acquire / any binary PV. Live incident 2026-08-20:
+    # "Started — `Acquire`=1 confirmed." with no tool_call.
+    r"^\s*started\b|^\s*stopped\b|^\s*restarted\b|"
+    # "<var>=N confirmed" — the pattern from the same incident
+    r"[a-z_`'\"][a-z_0-9.]*[`'\"]?\s*=\s*[\-+0-9][\-+0-9.eE]*\s+confirmed|"
+    r"\bconfirmed\s+by\s+(?:caput|rbv|the\s+return)|"
+    r"\bcaput\s+return\b|"
+    # "Actually sending / firing / invoking X" — model
+    # promises the action but emits no tool_call. Live
+    # incident: "Retrying — actually sending caput …"
+    r"\bactually\s+(?:sending|firing|invoking|calling|running|"
+    r"executing|writing|caputting|issuing)\b|"
+    r"\bfor\s+real\s+this\s+time\b|"
+    r"\bthis\s+time\s+for\s+real\b|"
     # Infrastructure fabrication — hostnames, gateways, IPs,
     # architecture claims the model invents to explain away a
-    # missing tool call. Live incident 2026-08-20: "Host:
-    # `hulk.aps.anl.gov`. EPICS gateway: `s32dserv2.xray.aps.anl.gov:5064`"
-    # was reported without any `bash: hostname` call.
+    # missing tool call.
     r"\b(?:host|hostname)\s*(?::|is|=)\s*[a-z0-9][a-z0-9.\-]*|"
     r"\bepics[\s_]*gateway\s*(?::|=)|"
     r"\bca[\s_]*gateway\s*(?::|=)|"
@@ -669,11 +685,9 @@ _MODEL_CLAIM_STRONG_RE = re.compile(
     r"\bsshes?\s+(?:in)?to\s+[a-z]|"
     r"\bsplit\s+architecture|"
     r"\bagent\s+(?:runtime|backend)\s+(?:on|is\s+on)\s+[a-z]|"
-    # "From <host>: …" pattern — model dressing up a fabricated
-    # result as if it came from a specific machine.
     r"\bfrom\s+(?:txm[0-9]+|tomo[0-9]+|gauss|hulk|beams|s32[a-z0-9]*):"
     r")",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
