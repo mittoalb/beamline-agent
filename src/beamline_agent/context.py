@@ -50,16 +50,19 @@ LOGGER = logging.getLogger(__name__)
 
 
 def bootstrap_agent_context_docs() -> None:
-    """Copy every packaged `.md` from `agent/context_docs/` into
-    `~/.pystream/docs/`, and every `.md` under
-    `agent/context_docs/procedures/**` into `~/.pystream/procedures/**`
-    (recursively). Never overwrites a regular file at the destination
-    (preserves user edits). Idempotent.
+    """First-launch discovery pass. Runs three things in order:
 
-    Also cleans up legacy symlinks from the older
-    `~/Software/*/AGENTS.md` scanner — those pointed at
-    machine-specific paths and don't survive a deploy to another
-    host, so they're replaced with the packaged copy."""
+    1. Copies every packaged `.md` from `beamline_agent/context_docs/`
+       into `~/.pystream/docs/` (short quick-reference docs).
+    2. Cleans up legacy symlinks from the old
+       `~/Software/*/AGENTS.md` scanner (defunct approach).
+    3. Reads `~/.pystream/agent_packages.json` and probes each
+       listed package for `data_dir()` (mirror into
+       `~/.pystream/procedures/`) or `AGENTS.md` at repo root
+       (copy to `~/.pystream/docs/<pkg>_AGENTS.md`).
+
+    Never overwrites a regular file at the destination — user edits
+    always win. Idempotent."""
     try:
         os.makedirs(DOCS_DIR, exist_ok=True)
     except OSError as e:
