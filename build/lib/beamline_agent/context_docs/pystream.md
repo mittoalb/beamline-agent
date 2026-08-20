@@ -139,7 +139,7 @@ system prompt. Both files ship inside the pystream package.
 |---|---|
 | `agent_settings.json` | Your protocol / URL / API key / model / prompt overrides |
 | `agent_history_dock.json` | Persistent chat history (your transcript with the user) |
-| `docs/*.md` | Instruction files the agent reads. **`pystream.md` is THIS file**; `tomogui.md` is the reconstruction sub-agent's prompt; `bl_gui.md` documents `bl-cli` for headless motor / layout / energy operations on bl32ID; `xanes_gui.md` documents `xanes-cli`; user notes may also live here. |
+| `docs/*.md` | Instruction files the agent reads. **`pystream.md` is THIS file**; `tomogui.md` is the reconstruction sub-agent's prompt; user notes may also live here. |
 | `task_recordings/` | Task Recorder sessions |
 | `task_contexts.json`, `task_tools.json` | Task Recorder per-task edits + published tools |
 | `bl32ID_settings.json`, `pv_aliases.json`, `ioc_scripts.json`, `status_pages.json` | Beamline / plugin config the user maintains |
@@ -158,10 +158,9 @@ the same user account.
 2. **"What's the status of X?" / "is Y running?"** → `list_status_pages()`, then `fetch_url` on the right entry.
 3. **"Read this PV" / "what's motor Z at?"** → `read_pv` (or `read_file` if it's a PV alias name — check `pv_aliases.json`).
 4. **"How do I align element E?"** → `list_task_recordings()` first; if a recording exists, `read_task_recording(slug)`; if not, say so and suggest recording one.
-5. **"What motors are on 32-ID?" / "move motor X" / "set energy to N keV" (32-ID)** → `bash: bl-cli ... --json`. See `~/.pystream/docs/bl_gui.md`. Prefer `bl-cli energy set <keV>` over raw caput to the energy PV — it uses the ZP calibration and moves every coordinated motor. Any motor move is a write: expect the caput confirmation dialog. For multi-step sequences, delegate to the `beamline_operator` sub-agent instead.
-6. **"Reconstruct X on tomo2" / anything tomogui** → `spawn_subagent("reconstruction", task=...)`. DO NOT SSH tomo2 yourself.
-7. **"Where does file Y live?" / config questions** → `bash: ls`, `read_file`, or check the paths in this doc.
-8. **User teaches you something worth keeping** → `save_learned_note(topic, content, tool="…")` so the user can `git diff` + commit it.
+5. **"Reconstruct X on tomo2" / anything tomogui** → `spawn_subagent("reconstruction", task=...)`. DO NOT SSH tomo2 yourself.
+6. **"Where does file Y live?" / config questions** → `bash: ls`, `read_file`, or check the paths in this doc.
+7. **User teaches you something worth keeping** → `save_learned_note(topic, content, tool="…")` so the user can `git diff` + commit it.
 
 ## What NOT to do
 

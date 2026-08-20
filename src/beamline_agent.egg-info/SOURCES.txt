@@ -19,6 +19,7 @@ src/beamline_agent.egg-info/top_level.txt
 src/beamline_agent/context_docs/README.md
 src/beamline_agent/context_docs/_learned.md
 src/beamline_agent/context_docs/beamline_operator.md
+src/beamline_agent/context_docs/bl_gui.md
 src/beamline_agent/context_docs/chemist.md
 src/beamline_agent/context_docs/condensers.md
 src/beamline_agent/context_docs/physicist.md

@@ -31,18 +31,9 @@ plugins to open and PVs to check.
 - **`bash`** — general shell. Set `timeout=600` for anything that
   SSHes into another host and runs. Use `timeout=30` for quick
   local checks.
-- **`bash: bl-cli ...`** — headless bl_gui: `bl-cli layout motors
-  --json` (enumerate PVs from the shipped layout, better than
-  guessing), `bl-cli motor rbv <PV>` / `bl-cli motor set <PV> <VAL>`
-  (bounded caget/caput with `--json` output), `bl-cli energy set
-  <keV>` (coordinated ZP + QG move via the calibration table — the
-  right tool for "set energy to N keV", NOT raw caput). Full
-  reference: `read_file ~/.pystream/docs/bl_gui.md`.
 - **`read_pv`, `caput`** — read/write EPICS PVs directly. `caput`
   pops a confirmation dialog — the user must approve. Prefer PV
-  aliases from `~/.pystream/pv_aliases.json`. For 32-ID motor
-  moves, prefer `bl-cli motor set` — same confirmation flow, plus
-  the layout gives you the PV to move if the user gave you a label.
+  aliases from `~/.pystream/pv_aliases.json`.
 - **`open_beamline_plugin(name)`, `list_beamline_plugins()`** — the
   ACTUAL tool dialogs (CoR, AlignPart, QGMax, Detector, XANES GUI,
   etc.) that appear in the pystream toolbar. Use these for anything
@@ -96,8 +87,7 @@ For every task:
 | "Find center of rotation" | `open_beamline_plugin("CoR")` |
 | "Align this particle to the axis" | `open_beamline_plugin("AlignPart")` |
 | "Optimize the beam / QGMax" | `open_beamline_plugin("QGMax")` |
-| "Set energy to 12 keV" (bl32ID) | `bash: bl-cli energy set 12.0 --dry-run --json` first to inspect the plan, then `bl-cli energy set 12.0` — coordinates ZP X/Y/Z + QG V/H via the calibration table. Do NOT raw-caput the energy PV; that skips the calibration. |
-| "What's the ZP Z position?" (bl32ID) | `bash: bl-cli motor rbv 32idbTXM:mcs2:c1:m15` (look up PVs via `bl-cli layout motors --json` if you don't know them). |
+| "Set energy to 12 keV" | Check current with `read_pv`, then `caput` energy PV (confirmation appears) |
 | "Move to Sigray condenser" | `open_beamline_plugin("BL GUI")` — it's the condenser selector |
 | "Show me the live detector" | `view_detector_image(pv=...)` |
 | "Prep for Cu XANES" | Sequence: energy → mono cal → detector check → XANES GUI. Do each step, confirm each, report at end. |
