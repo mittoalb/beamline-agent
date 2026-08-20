@@ -620,13 +620,20 @@ _USER_ACTION_RE = re.compile(
 # ("moved successfully to 1.0" AFTER a real caput). Require a numeric
 # value or explicit completion phrase so we don't false-positive on
 # educational replies like "you call caput to set a PV".
+#
+# Each alternation handles its own boundaries — a wrapping
+# `\b(...)\b` would break `done.` (the trailing `.` is non-word, so
+# `\b` after doesn't fire at end of string). Live incident 2026-08-20:
+# reply "From txm4: ZP X = 1.0. Done." wasn't detected because of that.
 _MODEL_CLAIM_WEAK_RE = re.compile(
-    r"\b("
-    r"moved\s+to\s+[\-+0-9]|set\s+to\s+[\-+0-9]|"
-    r"(?:already|now)\s+at\s+[\-+0-9.eE]+|"
-    r"done(?:\.|\s|$)|"
-    r"executed|complete(?:d)?"
-    r")\b",
+    r"("
+    r"\bmoved\s+to\s+[\-+0-9]|"
+    r"\bset\s+to\s+[\-+0-9]|"
+    r"\b(?:already|now)\s+at\s+[\-+0-9.eE]+|"
+    r"\bdone\b|"
+    r"\bexecuted\b|"
+    r"\bcomplete(?:d)?\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -661,7 +668,10 @@ _MODEL_CLAIM_STRONG_RE = re.compile(
     r"\b(?:runs?|running)\s+on\s+[a-z][a-z0-9.\-]*(?:\.aps\.anl\.gov)?|"
     r"\bsshes?\s+(?:in)?to\s+[a-z]|"
     r"\bsplit\s+architecture|"
-    r"\bagent\s+(?:runtime|backend)\s+(?:on|is\s+on)\s+[a-z]"
+    r"\bagent\s+(?:runtime|backend)\s+(?:on|is\s+on)\s+[a-z]|"
+    # "From <host>: …" pattern — model dressing up a fabricated
+    # result as if it came from a specific machine.
+    r"\bfrom\s+(?:txm[0-9]+|tomo[0-9]+|gauss|hulk|beams|s32[a-z0-9]*):"
     r")",
     re.IGNORECASE,
 )
