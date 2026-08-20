@@ -97,12 +97,28 @@ def bootstrap_agent_context_docs() -> None:
     _bootstrap_configured_packages()
 
 
-def _load_agent_packages() -> list[str]:
+def _load_agent_packages() -> list[dict]:
     """Read the user's `agent_packages.json`. Create an empty
-    template the first time it's missing. Returns the effective
-    package list (never raises — returns [] on any read error, so
-    the agent runs with zero configured packages until the user
-    fixes the file)."""
+    template the first time it's missing. Returns a normalised list
+    of entry dicts (never raises — returns [] on any read error).
+
+    Each entry is a dict with at least `{"name": <str>}` plus optional
+    fields:
+      env  — a conda env name the package is installed in when it
+             lives in a DIFFERENT env than beamline-agent. In that
+             case the package can't be `import`ed here; discovery
+             falls back to reading `AGENTS.md` from `path` (below)
+             and the agent invokes CLI tools via
+             `bash: conda run -n <env> <cli> …`.
+      path — absolute path to the package's checkout / source tree.
+             Used to find `AGENTS.md` when the package can't be
+             imported (cross-env case) or as a hint when the import
+             works. Defaults to `~/Software/<name>` if omitted.
+      cli  — optional CLI name to hint in the copied doc's preamble
+             ("`conda run -n <env> <cli> …`"). Cosmetic only.
+
+    The config accepts both bare strings (backwards compat — treated
+    as `{"name": <str>}`) and dict entries in the same list."""
     if not os.path.isfile(AGENT_PACKAGES_FILE):
         _write_empty_agent_packages_template()
     try:
@@ -117,7 +133,20 @@ def _load_agent_packages() -> list[str]:
         LOGGER.warning("%s missing top-level 'packages' list — no packages "
                        "will be discovered", AGENT_PACKAGES_FILE)
         return []
-    return [str(p) for p in pkgs if isinstance(p, str) and p.strip()]
+    out: list[dict] = []
+    for p in pkgs:
+        if isinstance(p, str) and p.strip():
+            out.append({"name": p.strip()})
+        elif isinstance(p, dict) and isinstance(p.get("name"), str):
+            entry = {"name": p["name"].strip()}
+            for k in ("env", "path", "cli"):
+                v = p.get(k)
+                if isinstance(v, str) and v.strip():
+                    entry[k] = v.strip()
+            out.append(entry)
+        else:
+            LOGGER.warning("agent-package entry ignored (bad shape): %r", p)
+    return out
 
 
 def copy_example_agent_packages(overwrite: bool = False) -> str:
@@ -179,27 +208,92 @@ def _write_empty_agent_packages_template() -> None:
 
 
 def _bootstrap_configured_packages() -> None:
-    """For each package in `agent_packages.json`, try to import it,
-    then run whichever discovery conventions match:
+    """For each entry in `agent_packages.json`, run whichever
+    discovery conventions match:
 
-      1. `<pkg>.data_dir()` returns a directory → recursively mirror
-         its `.md` files into `~/.pystream/procedures/` (procedures
-         package pattern, e.g. `beamlines_procedures`).
-      2. An `AGENTS.md` at or above `<pkg>.__file__` → copy to
-         `~/.pystream/docs/<pkg>.md` so the agent can `read_file`
-         it via a predictable path.
+      1. If the entry names an `env` (conda env), the package lives
+         in a DIFFERENT env than beamline-agent — we can't `import`
+         it here. Instead, look for `AGENTS.md` under `path` (or
+         `~/Software/<name>/`), copy to `<name>_AGENTS.md`, and
+         prepend a preamble telling the agent to invoke via
+         `conda run -n <env> <cli>`.
+      2. Otherwise, try `importlib.import_module(<name>)` in this
+         env. On success, probe for `data_dir()` (mirror procedures
+         tree) and for `AGENTS.md` at/above the package's __file__
+         (copy as `<name>_AGENTS.md`).
+      3. Missing packages / import failures are skipped silently.
 
-    Missing packages are skipped silently. Existing destination files
-    are preserved (user edits win) — same semantics as the top-level
-    docs bootstrap."""
-    for pkg_name in _load_agent_packages():
+    Existing destination files are preserved (user edits win)."""
+    for entry in _load_agent_packages():
+        name = entry["name"]
+        env = entry.get("env")
+        path = entry.get("path")
+        cli = entry.get("cli")
+        if env:
+            # Cross-env package — can't import, use path convention.
+            _bootstrap_cross_env_package(name, env, path, cli)
+            continue
         try:
-            mod = importlib.import_module(pkg_name)
+            mod = importlib.import_module(name)
         except Exception as e:
-            LOGGER.debug("agent-package %r not importable: %s", pkg_name, e)
+            LOGGER.debug("agent-package %r not importable: %s", name, e)
             continue
         _try_bootstrap_procedures_from(mod)
         _try_bootstrap_agents_md_from(mod)
+
+
+def _bootstrap_cross_env_package(name: str, env: str,
+                                  path: str | None,
+                                  cli: str | None) -> None:
+    """Find `AGENTS.md` for a package that lives in a different conda
+    env. Copies to `~/.pystream/docs/<name>_AGENTS.md` with a
+    preamble line telling the agent how to invoke it (e.g.
+    `conda run -n <env> <cli> …`). Silent no-op if AGENTS.md
+    can't be located."""
+    src_path = path or os.path.expanduser(f"~/Software/{name}")
+    agents_md = os.path.join(src_path, "AGENTS.md")
+    if not os.path.isfile(agents_md):
+        LOGGER.debug("cross-env package %r: no AGENTS.md at %s",
+                     name, agents_md)
+        return
+    dst = os.path.join(DOCS_DIR, f"{name}_AGENTS.md")
+    if os.path.isfile(dst) and not os.path.islink(dst):
+        return  # user-edited copy, preserve
+    try:
+        os.makedirs(DOCS_DIR, exist_ok=True)
+        if os.path.islink(dst):
+            os.unlink(dst)
+        preamble = _cross_env_preamble(name, env, cli)
+        with open(agents_md) as fsrc, open(dst, "w") as fdst:
+            fdst.write(preamble)
+            fdst.write(fsrc.read())
+    except OSError as e:
+        LOGGER.debug("failed to install cross-env doc %s → %s: %s",
+                     agents_md, dst, e)
+
+
+def _cross_env_preamble(name: str, env: str, cli: str | None) -> str:
+    """Prepend-to-the-doc note telling the agent this package is in
+    a different conda env and how to invoke it."""
+    invoke = f"conda run -n {env} {cli or '<cli>'}"
+    return (
+        f"# {name} — installed in conda env `{env}` (NOT this env)\n\n"
+        f"> ⚠️ **`{name}` is installed in a different conda "
+        f"environment than beamline-agent.** You CANNOT `import "
+        f"{name}` from your Python — the module isn't in your "
+        f"env's `site-packages`. Invoke via subprocess only:\n>\n"
+        f"> ```bash\n"
+        f"> {invoke} ...args...\n"
+        f"> ```\n>\n"
+        f"> Or use the env's Python directly if you need `python -c`:\n>\n"
+        f"> ```bash\n"
+        f"> ~/conda/*/envs/{env}/bin/python -c '...'\n"
+        f"> ```\n>\n"
+        f"> Everything below is the package's own AGENTS.md — the CLI "
+        f"names and options are correct; just prefix each invocation "
+        f"with `{invoke}` (or the direct-python form).\n\n"
+        f"---\n\n"
+    )
 
 
 def _try_bootstrap_procedures_from(mod) -> None:

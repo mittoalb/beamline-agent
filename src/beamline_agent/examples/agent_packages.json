@@ -1,10 +1,20 @@
 {
-  "_comment": "Example agent_packages.json for APS beamline hosts. Copy this to ~/.pystream/agent_packages.json (or edit the empty template that beamline-agent auto-creates on first launch). Each entry is a Python package name the agent probes on chat startup: `data_dir()` -> its tree is mirrored into ~/.pystream/procedures/; `AGENTS.md` at the package's repo root -> copied to ~/.pystream/docs/<pkg>_AGENTS.md. Packages not installed on this host are skipped silently, so a superset list is safe.",
+  "_comment": "Packages beamline-agent should discover at startup. Entries can be either a bare string (same-env import) or a dict for packages in a DIFFERENT conda env. Same-env: `import <name>` succeeds -> data_dir() mirrored, AGENTS.md copied. Cross-env dict: {\"name\": \"pkg\", \"env\": \"conda_env_name\", \"path\": \"/abs/path/to/checkout\" (optional; defaults to ~/Software/<name>), \"cli\": \"cli-name\" (optional; hint in the doc preamble)}. For cross-env entries beamline-agent CANNOT import the package, so it reads AGENTS.md from the path and prepends a note telling the agent to invoke via `conda run -n <env> <cli> ...`. Missing packages are skipped silently, so a superset list is safe.",
   "packages": [
     "pystream",
     "bl_gui",
     "xanes_gui",
     "tomogui",
-    "beamlines_procedures"
+    "beamlines_procedures",
+    {
+      "name": "iocs_monitor",
+      "env":  "iocs_monitor",
+      "cli":  "iom-cli"
+    },
+    {
+      "name": "lamn",
+      "env":  "python_servers",
+      "cli":  "lamn"
+    }
   ]
 }
