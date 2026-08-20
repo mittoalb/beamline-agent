@@ -55,4 +55,7 @@ where = ["src"]
 include = ["beamline_agent*"]
 
 [tool.setuptools.package-data]
-beamline_agent = ["context_docs/*.md"]
+beamline_agent = [
+    "context_docs/*.md",
+    "examples/*.json",
+]

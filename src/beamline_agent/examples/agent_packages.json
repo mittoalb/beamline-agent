@@ -1,0 +1,10 @@
+{
+  "_comment": "Example agent_packages.json for APS beamline hosts. Copy this to ~/.pystream/agent_packages.json (or edit the empty template that beamline-agent auto-creates on first launch). Each entry is a Python package name the agent probes on chat startup: `data_dir()` -> its tree is mirrored into ~/.pystream/procedures/; `AGENTS.md` at the package's repo root -> copied to ~/.pystream/docs/<pkg>_AGENTS.md. Packages not installed on this host are skipped silently, so a superset list is safe.",
+  "packages": [
+    "pystream",
+    "bl_gui",
+    "xanes_gui",
+    "tomogui",
+    "beamlines_procedures"
+  ]
+}
