@@ -10,6 +10,7 @@ src/beamline_agent/launcher_utils.py
 src/beamline_agent/panel.py
 src/beamline_agent/status.py
 src/beamline_agent/subagents.py
+src/beamline_agent/task_recorder.py
 src/beamline_agent.egg-info/PKG-INFO
 src/beamline_agent.egg-info/SOURCES.txt
 src/beamline_agent.egg-info/dependency_links.txt

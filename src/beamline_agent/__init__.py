@@ -177,15 +177,7 @@ def mount(host: HostContext,
         return dlg
 
     def _open_task_recorder():
-        # Task recorder lives in pystream today (uses the pystream
-        # viewer for frame grabs). Keep it there for the moment; the
-        # host wires it in via its own toolbar button. This mount
-        # entry stays as a placeholder for a future extraction pass.
-        try:
-            from pystream.task_recorder import TaskRecorderDialog
-        except ImportError:
-            LOGGER.warning("Task recorder not available (pystream not installed)")
-            return None
+        from .task_recorder import TaskRecorderDialog
         dlg = getattr(host.main_window, "_task_recorder_dialog", None)
         if dlg is None or not dlg.isVisible():
             dlg = TaskRecorderDialog(parent=host.main_window)
