@@ -611,14 +611,21 @@ DEFAULT_THINKING_BUDGET = 8000
 
 def _supports_thinking(model: str) -> bool:
     """True for Anthropic models known to support extended thinking.
-    Conservative allow-list: Sonnet 4+, Opus 4+, Haiku 4.5+, Fable 5+.
-    Older 3.x families (and unknown/proxied model ids) default to False."""
+    Modern naming: family before version (sonnet-4+, opus-4+, haiku-4+,
+    fable-4+). Legacy 3.7 naming: version before family (claude-3-7-*).
+    Case- and separator-insensitive so friendly names ("Claude Opus 4.7"),
+    Vertex ids ("claude-opus-4@20250514"), and Bedrock ids
+    ("us.anthropic.claude-sonnet-5-v1:0") all resolve correctly."""
     if not model:
         return False
-    return bool(re.search(
-        r"claude-(sonnet|opus|haiku|fable)-[4-9](?:[-.]|$)",
-        model.lower(),
-    ))
+    m = model.lower()
+    # Modern: {family}[sep]{version >= 4}. Separator is any of -, _, ., @, /, space.
+    if re.search(r"(?:sonnet|opus|haiku|fable)[\s\-_.@/]*[4-9]", m):
+        return True
+    # Legacy 3.7 (Claude 3.7 Sonnet/Opus/Haiku all support thinking).
+    if re.search(r"claude[\s\-_.]*3[\s\-_.]*7[\s\-_.]*(?:sonnet|opus|haiku)", m):
+        return True
+    return False
 
 
 class _ProviderAdapter:
@@ -750,17 +757,19 @@ class _AnthropicAdapter(_ProviderAdapter):
             "messages": messages,
         }
         if self.thinking_budget > 0:
-            # When thinking is on, don't pass `temperature`. Anthropic's
-            # implicit default (1.0) is required with thinking anyway, and
-            # Vertex-hosted models on GCP reject an explicit temperature
-            # entirely on newer deployments ("temperature is deprecated
-            # for this model"). Omitting it works on every backend.
             params["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": self.thinking_budget,
             }
-        else:
-            params["temperature"] = self.temperature
+        # Never pass `temperature` to Anthropic. Newer Vertex-hosted models
+        # (and the Argonne argoapi that forwards to them) reject any
+        # explicit temperature outright ("temperature is deprecated for
+        # this model"), and models with thinking enabled require exactly
+        # 1.0 anyway. On older models we lose the low-temp benefit — but
+        # the tool-first system prompt does the same job of keeping the
+        # model from sampling creatively when it should be calling tools.
+        # `self.temperature` is retained on the instance so the OpenAI
+        # adapter (which does accept temperature) can share the default.
         return self.client.messages.create(**params)
 
     def extract_usage(self, response):
