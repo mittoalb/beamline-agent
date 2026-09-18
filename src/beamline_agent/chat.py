@@ -750,12 +750,15 @@ class _AnthropicAdapter(_ProviderAdapter):
             "messages": messages,
         }
         if self.thinking_budget > 0:
-            # Anthropic requires temperature=1 when thinking is enabled.
+            # When thinking is on, don't pass `temperature`. Anthropic's
+            # implicit default (1.0) is required with thinking anyway, and
+            # Vertex-hosted models on GCP reject an explicit temperature
+            # entirely on newer deployments ("temperature is deprecated
+            # for this model"). Omitting it works on every backend.
             params["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": self.thinking_budget,
             }
-            params["temperature"] = 1.0
         else:
             params["temperature"] = self.temperature
         return self.client.messages.create(**params)
