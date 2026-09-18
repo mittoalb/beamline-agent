@@ -606,7 +606,8 @@ def _openai_tool_result_text(result):
 # below applies only when thinking is off.
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 0.2
-DEFAULT_THINKING_BUDGET = 8000
+DEFAULT_THINKING_BUDGET = 8000   # v4.x / 3.7 fixed-budget mode
+DEFAULT_THINKING_EFFORT = "high"  # v5+ adaptive mode: "low" | "medium" | "high"
 
 
 def _supports_thinking(model: str) -> bool:
@@ -626,6 +627,19 @@ def _supports_thinking(model: str) -> bool:
     if re.search(r"claude[\s\-_.]*3[\s\-_.]*7[\s\-_.]*(?:sonnet|opus|haiku)", m):
         return True
     return False
+
+
+def _uses_adaptive_thinking(model: str) -> bool:
+    """True for models that require the newer `thinking.type=adaptive`
+    API shape (Sonnet 5+, Opus 5+, Fable 5+, Haiku 5+). Older thinking-
+    capable models (Sonnet 4.x, Opus 4.x, Haiku 4.5, Claude 3.7) still
+    use `thinking.type=enabled` with an explicit `budget_tokens`."""
+    if not model:
+        return False
+    return bool(re.search(
+        r"(?:sonnet|opus|haiku|fable)[\s\-_.@/]*[5-9]",
+        model.lower(),
+    ))
 
 
 class _ProviderAdapter:
@@ -732,7 +746,8 @@ class _AnthropicAdapter(_ProviderAdapter):
     def __init__(self, client, model, tools, *,
                  max_tokens=DEFAULT_MAX_TOKENS,
                  temperature=DEFAULT_TEMPERATURE,
-                 thinking_budget=DEFAULT_THINKING_BUDGET):
+                 thinking_budget=DEFAULT_THINKING_BUDGET,
+                 thinking_effort=DEFAULT_THINKING_EFFORT):
         self.client = client
         self.model = model
         self.tools = tools
@@ -740,6 +755,7 @@ class _AnthropicAdapter(_ProviderAdapter):
         self.temperature = temperature
         self.thinking_budget = (
             thinking_budget if _supports_thinking(model) else 0)
+        self.thinking_effort = thinking_effort
 
     def initial_messages(self, system_prompt, history, user_text):
         return [*history, {"role": "user", "content": user_text}]
@@ -757,10 +773,21 @@ class _AnthropicAdapter(_ProviderAdapter):
             "messages": messages,
         }
         if self.thinking_budget > 0:
-            params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": self.thinking_budget,
-            }
+            # Two thinking API shapes coexist in the Anthropic model
+            # lineup:
+            #   * v4.x, 3.7 → `{"type":"enabled","budget_tokens":N}` —
+            #     caller sets the budget.
+            #   * v5+ → `{"type":"adaptive"}` + `output_config.effort`
+            #     — the model decides its own budget based on task
+            #     complexity. Sonnet 5 hard-rejects the older shape.
+            if _uses_adaptive_thinking(self.model):
+                params["thinking"] = {"type": "adaptive"}
+                params["output_config"] = {"effort": self.thinking_effort}
+            else:
+                params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self.thinking_budget,
+                }
         # Never pass `temperature` to Anthropic. Newer Vertex-hosted models
         # (and the Argonne argoapi that forwards to them) reject any
         # explicit temperature outright ("temperature is deprecated for
