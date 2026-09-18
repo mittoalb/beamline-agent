@@ -754,6 +754,290 @@ def _hallucination_snippet(reply_text: str, limit: int = 80) -> str:
     return t[:limit] + "…"
 
 
+# ── provider-agnostic tool loop ─────────────────────────────────────────
+#
+# `ToolRunner` owns the loop shape shared by every Chat protocol we speak:
+# iteration accounting, usage-token totals, the hallucination guard, and
+# the tool-dispatch → tool_result plumbing. The provider-specific bits
+# (API shape, response walking, message formats) are delegated to a
+# `_ProviderAdapter`. Adding a new backend is a new adapter, not a new
+# loop copy.
+
+class _ProviderAdapter:
+    """Provider-specific parts of one agentic turn. Every method is
+    called by `ToolRunner.run()` — the loop lives there, not here."""
+
+    def initial_messages(self, system_prompt, history, user_text):
+        """Return the starting `messages` list for the API call."""
+        raise NotImplementedError
+
+    def call(self, system_prompt, messages):
+        """Invoke the API and return the raw response object."""
+        raise NotImplementedError
+
+    def extract_usage(self, response) -> dict:
+        """Return {'input', 'output', 'cache_read', 'cache_write'} deltas."""
+        raise NotImplementedError
+
+    def extract_tool_calls(self, response) -> list:
+        """Return the list of provider-native tool_call objects, or []
+        if the response is a final answer with no tool use this round."""
+        raise NotImplementedError
+
+    def extract_text(self, response) -> str:
+        """Return the assistant's text answer for this response."""
+        raise NotImplementedError
+
+    def tool_call_name(self, tool_call) -> str: raise NotImplementedError
+    def tool_call_args(self, tool_call) -> dict: raise NotImplementedError
+
+    def append_assistant_turn(self, messages, response):
+        """Append the assistant turn (with tool_use blocks) to messages."""
+        raise NotImplementedError
+
+    def format_tool_result(self, tool_call, result):
+        """Format one tool's result as the provider expects it. Either a
+        block to be wrapped by `append_tool_results` (Anthropic) or a
+        full message dict to be appended directly (OpenAI)."""
+        raise NotImplementedError
+
+    def append_tool_results(self, messages, tool_results):
+        """Append all this round's tool_result payloads to messages."""
+        raise NotImplementedError
+
+    def append_hallucination_correction(self, messages, response, text, correction):
+        """Append an assistant-then-user pair to prompt a corrected retry."""
+        raise NotImplementedError
+
+
+class ToolRunner:
+    """One agentic turn: send → maybe tool_use → repeat until final text
+    or the iteration cap trips. Provider-agnostic; `adapter` supplies the
+    API shape. Keeps a running usage total across all internal calls in
+    the turn (so tool-heavy turns bill correctly)."""
+
+    def __init__(self, *, adapter, tool_ctx, emit_tool, confirm,
+                 max_iterations=None, hallucination_max_retries=None):
+        self.adapter = adapter
+        self.tool_ctx = tool_ctx
+        self.emit_tool = emit_tool
+        self.confirm = confirm
+        self.max_iterations = (
+            MAX_AGENT_ITERATIONS if max_iterations is None else max_iterations)
+        self.hallucination_max_retries = (
+            HALLUCINATION_MAX_RETRIES if hallucination_max_retries is None
+            else hallucination_max_retries)
+
+    def run(self, system_prompt, history, user_text):
+        adapter = self.adapter
+        messages = adapter.initial_messages(system_prompt, history, user_text)
+        totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+        tools_called_this_turn = 0
+        hallucination_retries = 0
+
+        for _ in range(self.max_iterations):
+            response = adapter.call(system_prompt, messages)
+            for k, v in adapter.extract_usage(response).items():
+                totals[k] += v
+
+            tool_calls = adapter.extract_tool_calls(response)
+            if not tool_calls:
+                text = adapter.extract_text(response)
+                # Hallucination guard — see the section-header comment above
+                # `_is_action_hallucination` for the incident this fixes.
+                if _is_action_hallucination(
+                        user_text, text, tools_called_this_turn):
+                    if hallucination_retries < self.hallucination_max_retries:
+                        hallucination_retries += 1
+                        LOGGER.warning(
+                            "hallucinated action reply (retry %d/%d): %r",
+                            hallucination_retries,
+                            self.hallucination_max_retries,
+                            text[:120])
+                        correction = _HALLUCINATION_CORRECTION.format(
+                            claim_snippet=_hallucination_snippet(text))
+                        adapter.append_hallucination_correction(
+                            messages, response, text, correction)
+                        continue
+                    # Retries exhausted — prepend a clear warning so the
+                    # user sees "this reply is fabricated" instead of
+                    # trusting the fake success message.
+                    LOGGER.error(
+                        "hallucination guard exhausted; delivering reply "
+                        "with warning banner: %r", text[:120])
+                    return _HALLUCINATION_BANNER + "\n\n" + text, totals
+                return text, totals
+
+            # Append the assistant's content (text + tool_use blocks) verbatim,
+            # then run each tool and feed results back.
+            adapter.append_assistant_turn(messages, response)
+            tools_called_this_turn += len(tool_calls)
+            tool_results = []
+            for tc in tool_calls:
+                name = adapter.tool_call_name(tc)
+                args = adapter.tool_call_args(tc)
+                self.emit_tool(name, args, None)
+                result = _execute_tool(
+                    name, args, self.tool_ctx, confirm=self.confirm)
+                self.emit_tool(name, args, result)
+                tool_results.append(adapter.format_tool_result(tc, result))
+            adapter.append_tool_results(messages, tool_results)
+
+        return ("(stopped: hit MAX_AGENT_ITERATIONS — too many tool calls)",
+                totals)
+
+
+class _AnthropicAdapter(_ProviderAdapter):
+    """Anthropic Messages API adapter. Uses tool_use / tool_result blocks
+    and packages every tool round's results into a single user turn."""
+
+    def __init__(self, client, model, tools):
+        self.client = client
+        self.model = model
+        self.tools = tools
+
+    def initial_messages(self, system_prompt, history, user_text):
+        return [*history, {"role": "user", "content": user_text}]
+
+    def call(self, system_prompt, messages):
+        return self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            tools=self.tools,
+            messages=messages,
+        )
+
+    def extract_usage(self, response):
+        u = response.usage
+        return {
+            "input":       getattr(u, "input_tokens", 0) or 0,
+            "output":      getattr(u, "output_tokens", 0) or 0,
+            "cache_read":  getattr(u, "cache_read_input_tokens", 0) or 0,
+            "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        }
+
+    def extract_tool_calls(self, response):
+        if response.stop_reason != "tool_use":
+            return []
+        return [b for b in response.content
+                if getattr(b, "type", None) == "tool_use"]
+
+    def extract_text(self, response):
+        return "".join(
+            b.text for b in response.content
+            if getattr(b, "type", None) == "text"
+        ).strip()
+
+    def tool_call_name(self, tool_call): return tool_call.name
+    def tool_call_args(self, tool_call): return tool_call.input
+
+    def append_assistant_turn(self, messages, response):
+        messages.append({"role": "assistant", "content": response.content})
+
+    def format_tool_result(self, tool_call, result):
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_call.id,
+            "content": _anthropic_tool_result_content(result),
+        }
+
+    def append_tool_results(self, messages, tool_results):
+        messages.append({"role": "user", "content": tool_results})
+
+    def append_hallucination_correction(self, messages, response, text, correction):
+        # Feed the model back a user-role correction. Anthropic models handle
+        # a plain user message here; the previous assistant text stays in
+        # context so the model can see what it claimed vs. what it should
+        # have done.
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": correction})
+
+
+class _OpenAIAdapter(_ProviderAdapter):
+    """OpenAI Chat Completions adapter. Emits one `role: tool` message per
+    tool call and preserves the model's `tool_calls` array on the
+    assistant turn so the follow-up references match."""
+
+    def __init__(self, client, model, tools):
+        self.client = client
+        self.model = model
+        self.tools = tools
+        self._last_msg = None  # cache to avoid re-walking .choices[0]
+
+    def initial_messages(self, system_prompt, history, user_text):
+        return [
+            {"role": "system", "content": system_prompt},
+            *history,
+            {"role": "user", "content": user_text},
+        ]
+
+    def call(self, system_prompt, messages):
+        response = self.client.chat.completions.create(
+            model=self.model, messages=messages, tools=self.tools,
+            max_tokens=4096,
+        )
+        self._last_msg = response.choices[0].message
+        return response
+
+    def extract_usage(self, response):
+        u = response.usage
+        cd = getattr(u, "prompt_tokens_details", None)
+        return {
+            "input":       getattr(u, "prompt_tokens", 0) or 0,
+            "output":      getattr(u, "completion_tokens", 0) or 0,
+            "cache_read":  (getattr(cd, "cached_tokens", 0) or 0) if cd else 0,
+            "cache_write": 0,
+        }
+
+    def extract_tool_calls(self, response):
+        return list(self._last_msg.tool_calls or [])
+
+    def extract_text(self, response):
+        return (self._last_msg.content or "").strip()
+
+    def tool_call_name(self, tool_call): return tool_call.function.name
+
+    def tool_call_args(self, tool_call):
+        try:
+            return json.loads(tool_call.function.arguments or "{}")
+        except Exception:
+            return {}
+
+    def append_assistant_turn(self, messages, response):
+        msg = self._last_msg
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [{
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            } for tc in msg.tool_calls],
+        })
+
+    def format_tool_result(self, tool_call, result):
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": _openai_tool_result_text(result),
+        }
+
+    def append_tool_results(self, messages, tool_results):
+        messages.extend(tool_results)
+
+    def append_hallucination_correction(self, messages, response, text, correction):
+        messages.append({"role": "assistant", "content": text})
+        messages.append({"role": "user", "content": correction})
+
+
 # ── chat: Anthropic protocol ────────────────────────────────────────────
 
 def _chat_anthropic(base_url, api_key, model, system_prompt,
@@ -765,83 +1049,10 @@ def _chat_anthropic(base_url, api_key, model, system_prompt,
     client = anthropic.Anthropic(base_url=base_url, api_key=api_key,
                                  timeout=60.0, max_retries=2)
     tools = tool_ctx.get("tool_specs_anthropic", []) or []
-    messages = [*history, {"role": "user", "content": user_text}]
-
-    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-    tools_called_this_turn = 0    # for the hallucination detector
-    hallucination_retries = 0
-
-    for _ in range(MAX_AGENT_ITERATIONS):
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=[{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            tools=tools,
-            messages=messages,
-        )
-        u = response.usage
-        totals["input"] += getattr(u, "input_tokens", 0) or 0
-        totals["output"] += getattr(u, "output_tokens", 0) or 0
-        totals["cache_read"] += getattr(u, "cache_read_input_tokens", 0) or 0
-        totals["cache_write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
-
-        if response.stop_reason != "tool_use":
-            text = "".join(
-                b.text for b in response.content
-                if getattr(b, "type", None) == "text"
-            ).strip()
-
-            # Hallucination guard — see the section-header comment above
-            # `_is_action_hallucination` for the incident this fixes.
-            if _is_action_hallucination(
-                    user_text, text, tools_called_this_turn):
-                if hallucination_retries < HALLUCINATION_MAX_RETRIES:
-                    hallucination_retries += 1
-                    LOGGER.warning(
-                        "hallucinated action reply (retry %d/%d): %r",
-                        hallucination_retries, HALLUCINATION_MAX_RETRIES,
-                        text[:120])
-                    # Feed the model back a user-role correction. Anthropic
-                    # models handle a plain user message here; the previous
-                    # assistant text stays in-context so the model can see
-                    # what it claimed vs. what it should have done.
-                    messages.append({"role": "assistant",
-                                      "content": response.content})
-                    messages.append({"role": "user", "content":
-                        _HALLUCINATION_CORRECTION.format(
-                            claim_snippet=_hallucination_snippet(text))})
-                    continue
-                # Retries exhausted — prepend a clear warning so the
-                # user sees "this reply is fabricated" instead of
-                # trusting the fake success message.
-                LOGGER.error("hallucination guard exhausted; delivering "
-                             "reply with warning banner: %r", text[:120])
-                return _HALLUCINATION_BANNER + "\n\n" + text, totals
-
-            return text, totals
-
-        # Append the assistant's content (text + tool_use blocks) verbatim,
-        # then run each tool and feed results back as a user turn.
-        messages.append({"role": "assistant", "content": response.content})
-        tool_results = []
-        for b in response.content:
-            if getattr(b, "type", None) == "tool_use":
-                tools_called_this_turn += 1
-                emit_tool(b.name, b.input, None)
-                result = _execute_tool(b.name, b.input, tool_ctx, confirm=confirm)
-                emit_tool(b.name, b.input, result)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": b.id,
-                    "content": _anthropic_tool_result_content(result),
-                })
-        messages.append({"role": "user", "content": tool_results})
-
-    return "(stopped: hit MAX_AGENT_ITERATIONS — too many tool calls)", totals
+    adapter = _AnthropicAdapter(client, model, tools)
+    runner = ToolRunner(adapter=adapter, tool_ctx=tool_ctx,
+                        emit_tool=emit_tool, confirm=confirm)
+    return runner.run(system_prompt, history, user_text)
 
 
 # ── chat: OpenAI protocol ───────────────────────────────────────────────
@@ -858,77 +1069,10 @@ def _chat_openai(base_url, api_key, model, system_prompt,
     client = OpenAI(base_url=base_url, api_key=_resolve_api_key(api_key),
                     timeout=60.0, max_retries=2)
     tools = tool_ctx.get("tool_specs_openai", []) or []
-    messages = [
-        {"role": "system", "content": system_prompt},
-        *history,
-        {"role": "user", "content": user_text},
-    ]
-    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-    tools_called_this_turn = 0
-    hallucination_retries = 0
-
-    for _ in range(MAX_AGENT_ITERATIONS):
-        response = client.chat.completions.create(
-            model=model, messages=messages, tools=tools, max_tokens=4096,
-        )
-        u = response.usage
-        totals["input"] += getattr(u, "prompt_tokens", 0) or 0
-        totals["output"] += getattr(u, "completion_tokens", 0) or 0
-        cd = getattr(u, "prompt_tokens_details", None)
-        totals["cache_read"] += (getattr(cd, "cached_tokens", 0) or 0) if cd else 0
-
-        msg = response.choices[0].message
-        if not msg.tool_calls:
-            text = (msg.content or "").strip()
-            # Hallucination guard — mirror of the Anthropic path above.
-            if _is_action_hallucination(
-                    user_text, text, tools_called_this_turn):
-                if hallucination_retries < HALLUCINATION_MAX_RETRIES:
-                    hallucination_retries += 1
-                    LOGGER.warning(
-                        "hallucinated action reply (retry %d/%d): %r",
-                        hallucination_retries, HALLUCINATION_MAX_RETRIES,
-                        text[:120])
-                    messages.append({"role": "assistant", "content": text})
-                    messages.append({"role": "user", "content":
-                        _HALLUCINATION_CORRECTION.format(
-                            claim_snippet=_hallucination_snippet(text))})
-                    continue
-                LOGGER.error("hallucination guard exhausted; delivering "
-                             "reply with warning banner: %r", text[:120])
-                return _HALLUCINATION_BANNER + "\n\n" + text, totals
-            return text, totals
-
-        # Re-attach the assistant turn including its tool_calls, then send
-        # one tool message per call.
-        messages.append({
-            "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [{
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            } for tc in msg.tool_calls],
-        })
-        tools_called_this_turn += len(msg.tool_calls)
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except Exception:
-                args = {}
-            emit_tool(tc.function.name, args, None)
-            result = _execute_tool(tc.function.name, args, tool_ctx, confirm=confirm)
-            emit_tool(tc.function.name, args, result)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": _openai_tool_result_text(result),
-            })
-
-    return "(stopped: hit MAX_AGENT_ITERATIONS — too many tool calls)", totals
+    adapter = _OpenAIAdapter(client, model, tools)
+    runner = ToolRunner(adapter=adapter, tool_ctx=tool_ctx,
+                        emit_tool=emit_tool, confirm=confirm)
+    return runner.run(system_prompt, history, user_text)
 
 
 # ── worker thread ───────────────────────────────────────────────────────
