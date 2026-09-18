@@ -324,12 +324,56 @@ def _confirmation_message(name: str, args: dict) -> str:
     )
 
 
+CAPUT_BYPASS_FILE = os.path.join(PYSTREAM_HOME, "caput_bypass.json")
+
+# Default PV patterns whose caput writes skip the confirmation dialog.
+# fnmatch-style globs; empty list means every caput confirms. Presence of
+# a file at CAPUT_BYPASS_FILE (a JSON list, or {"patterns": [...]})
+# completely REPLACES these defaults, so a user can widen or narrow the
+# bypass without touching code. Camera Acquire toggles are virtually
+# without risk — worst case is a lost frame — hence the default entry.
+_DEFAULT_CAPUT_BYPASS_PATTERNS = [
+    "*:Acquire",       # areaDetector camera start/stop (any IOC)
+    "*:cam*:Acquire",  # explicit form some IOCs use
+]
+
+
+def _load_caput_bypass_patterns() -> list:
+    """Return the effective bypass patterns. If the user has authored
+    ~/.pystream/caput_bypass.json, that list wins outright; otherwise
+    the defaults apply."""
+    try:
+        with open(CAPUT_BYPASS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(p) for p in data]
+        if isinstance(data, dict) and isinstance(data.get("patterns"), list):
+            return [str(p) for p in data["patterns"]]
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return list(_DEFAULT_CAPUT_BYPASS_PATTERNS)
+
+
+def _caput_bypassed(pv_name: str) -> bool:
+    """True when `pv_name` matches an allowlisted bypass pattern."""
+    if not pv_name:
+        return False
+    import fnmatch
+    for pat in _load_caput_bypass_patterns():
+        if fnmatch.fnmatchcase(pv_name, pat):
+            return True
+    return False
+
+
 def _needs_confirmation(name: str, arguments: dict, tool_ctx: dict) -> bool:
     """True if this tool call should pop the Yes/No dialog. Static for
-    write tools; dynamic for bash (only destructive commands gate).
+    write tools; dynamic for bash (only destructive commands gate) and
+    for caput (PV allowlist can skip confirmation for low-risk writes).
     `tool_ctx` supplies the write-set and the bash-heuristic from the
     active beamline."""
     if name in tool_ctx.get("write_tools", set()):
+        if name == "caput" and _caput_bypassed(arguments.get("pv_name", "")):
+            return False
         return True
     if name == "bash":
         is_destructive = tool_ctx.get("is_destructive", lambda _c: False)
