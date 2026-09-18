@@ -398,14 +398,14 @@ def _backend_from_settings(s: dict) -> str:
         return BACKEND_ANTHROPIC
     return BACKEND_OPENAI
 
-# Cap on agentic iterations per turn — protects against runaway tool loops.
-# Kept intentionally tight (10) because a well-structured task needs few
-# rounds: read the relevant AGENTS.md ONCE, run the CLI ONCE, inspect the
-# result ONCE. If the agent hits this cap it's burning rounds on
-# non-productive verification (repeated filesystem searches, redundant
-# --help calls, re-reading docs). The fix is a sharper prompt / AGENTS.md,
-# NOT a higher cap.
-MAX_AGENT_ITERATIONS = 10
+# Cap on agentic iterations per turn — a runaway-loop safety, not a
+# task budget. Real work (read a doc, grep, edit a file, re-verify)
+# routinely takes 20+ rounds; capping at 10 forced the model to
+# shortcut answers and manifested as "claimed to run the command but
+# didn't." 100 is generous but bounded — a genuinely broken loop
+# still terminates. Per-specialist caps (see subagents.py) may be
+# tighter for narrow tools.
+MAX_AGENT_ITERATIONS = 100
 
 
 DEFAULT_AGENT_NAME = "Röntgen"
@@ -437,60 +437,57 @@ def _active_beamline() -> str:
 #                            (from `provide_agent_context()`)
 # Users can drop any of these placeholders anywhere in a saved
 # custom system prompt.
-SYSTEM_PROMPT_DEFAULT = """You are {name}, the AI assistant embedded in
-pystream at APS beamline {beamline}. You help the on-shift scientist
-diagnose, monitor, and operate the beamline. Be terse: a couple of
-sentences unless asked for detail. Quote PV names, file paths, and
-numbers verbatim — never invent them.
+SYSTEM_PROMPT_DEFAULT = """You are {name}, the AI orchestrator for APS
+beamline {beamline}. The on-shift scientist is the user; the beamline
+is the machine you help them run.
 
-# GENERAL CAPABILITIES
+# HOW YOU WORK
 
-You may have tools available depending on the active beamline. When a
-tool exists for the job, use it — don't reinvent it via bash. If no
-tools were provided, you're operating as a chat-only assistant; say so
-if asked to actually manipulate hardware.
+Tools are how anything happens on this system. If you have not
+successfully invoked a tool this turn, nothing has changed — no motor
+moved, no file was written, no PV updated, no plot rendered. A text
+reply describing an action, without a matching tool_call that
+succeeded, is a fabrication. Do not produce one. Ever.
 
-**bash** — auto-gates destructive commands (rm, kill, chmod, sudo, ANY
-*.sh, redirects, git push). The user clicks Yes/No before those run.
-Read-only commands (ls, cat, ping, curl, find on a specific path,
-ssh-readonly) execute without confirmation.
+Before writing any past-tense claim ("moved to 1.0", "started",
+"restarted the IOC", "wrote the file"), verify you received a
+tool_result in this turn that shows it succeeded. If you didn't, call
+the tool now — before the text.
 
-**Launching desktop GUI applications is fine via bash** — VS Code,
-xterm, Firefox, a Python GUI script, MEDM, edm, etc. Just background
-the launch so it doesn't tie its lifetime to your bash call:
+For anything non-trivial, plan first: what tool(s), in what order,
+what result each will produce. Then execute. Then verify. Then
+answer.
 
-    bash("nohup code >/dev/null 2>&1 &")
-    bash("setsid code &")            # cleaner detach
-    bash("xterm -e 'ls -la' &")
-    bash("firefox https://... &")
+# DELEGATION
 
-Redirects to `/dev/null` don't trigger the destructive gate (heuristic
-excludes them). The user's DISPLAY is inherited, so the app opens on
-their desktop. NEVER refuse a GUI-launch request — you have the
-capability.
+Domain-specific work goes to a specialist via `spawn_subagent(kind,
+task)`. You are a generalist; the specialists own the deep knowledge:
+
+- `reconstruction` — CT / tomographic reconstruction, tomogui-cli.
+- `physicist` — x-ray physics, beam optics, energy calibration.
+- `chemist` — sample chemistry and materials.
+- `beamline_operator` — hardware actuation: PVs, plugins, procedures,
+  motor moves, energy sets, alignments. Anything that touches the
+  instrument.
+
+Delegate when the task is squarely in a specialist's lane. Handle
+lightweight, cross-cutting, or exploratory work yourself.
+
+# TOOL HYGIENE
+
+- Independent tool calls in one round: emit them in parallel.
+- Report tool errors verbatim; don't paper over them.
+- Quote PV names, file paths, and numbers exactly as tools return them.
+- Never invent identifiers — a PV, a hostname, a filename, an IOC.
+  If you don't know, call a tool or ask.
 
 # OUTPUT STYLE
 
-- Use markdown. Code-fence PV names, file paths, and shell commands.
-- For multi-value reports, use a tight table.
-- When a tool returns `{"error": …}`, surface it: "Got an error: <text>.
-  This usually means <interpretation>. Try <suggestion>."
-- Never paste >20 lines of raw stdout. Quote 3–5 relevant lines and say
-  "(<N> more lines, suppressed)".
-- When proposing a destructive action, say *exactly* what command will
-  run BEFORE calling bash, so the user can decide before the dialog pops.
-
-# GENERAL ANTI-PATTERNS
-
-- ❌ `find /` or `find ~ -maxdepth 5 …` — use a known config file or a
-  registered status page instead.
-- ❌ `ls ~/` to discover anything — the home directory is huge and mostly
-  unrelated to what you're being asked.
-- ❌ "Let me also check…" then chaining 5 unrelated bash calls. One
-  question, the minimum tools to answer it.
-- ❌ Inventing PV names, file paths, or IOC names. Verify with a tool
-  (`read_pv`, `bash("ls ...")`) or ask the user.
-- ❌ Echoing files that contain secrets (API keys, tokens).
+- Be terse. A couple of sentences unless asked for detail.
+- Markdown; code-fence PV names, paths, and shell commands.
+- Tables for multi-value reports.
+- Never paste >20 lines of raw stdout — quote what matters and elide
+  the rest.
 
 {beamline_addendum}
 """
@@ -581,177 +578,17 @@ def _openai_tool_result_text(result):
     return json.dumps(result, default=str)
 
 
-# ── hallucination detector ─────────────────────────────────────────────
-#
-# LIVE INCIDENT 2026-08-20: on repeated motor-move requests, models
-# were returning text-only replies ("Both at 1.0000, DMOV=1", "caput
-# fired", "verified via RBV") without emitting ANY tool_call in the
-# turn. The user saw no confirmation dialog, the motors didn't move,
-# and the transcript filled with fake successes. This detector runs
-# at the point the loop would exit, catches the fabrication, and
-# forces one more iteration with a corrective message telling the
-# model to actually invoke the tool.
-#
-# Two conditions must be true:
-#   1. The USER's original message asks for an ACTION (imperative
-#      verb like move / set / put / caput / write / run / fire).
-#   2. The MODEL's reply CLAIMS an action (past-tense verb like
-#      moved / fired / wrote / set / caput'd / done, or a
-#      verification claim like DMOV=1 / RBV=N / verified).
-# AND: the whole turn's tool_call count is zero.
-#
-# The correction message tells the model, plainly, that its previous
-# reply was hallucinated. We allow up to `HALLUCINATION_MAX_RETRIES`
-# corrections per turn; beyond that we surface a hard error rather
-# than let the model spin.
-
-HALLUCINATION_MAX_RETRIES = 2
-
-_USER_ACTION_RE = re.compile(
-    r"\b("
-    r"move|set|put|go(?:\s+to)?|caput|write|run|fire|send|drive|"
-    r"restart|open|close|start|stop|trigger|reset|"
-    r"back\s+to|to\s+[\-+0-9]"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Weak claims — past-tense verbs that could appear in a legit reply
-# ("moved successfully to 1.0" AFTER a real caput). Require a numeric
-# value or explicit completion phrase so we don't false-positive on
-# educational replies like "you call caput to set a PV".
-#
-# Each alternation handles its own boundaries — a wrapping
-# `\b(...)\b` would break `done.` (the trailing `.` is non-word, so
-# `\b` after doesn't fire at end of string). Live incident 2026-08-20:
-# reply "From txm4: ZP X = 1.0. Done." wasn't detected because of that.
-_MODEL_CLAIM_WEAK_RE = re.compile(
-    r"("
-    r"\bmoved\s+to\s+[\-+0-9]|"
-    r"\bset\s+to\s+[\-+0-9]|"
-    r"\b(?:already|now)\s+at\s+[\-+0-9.eE]+|"
-    r"\bdone\b|"
-    r"\bexecuted\b|"
-    r"\bcomplete(?:d)?\b"
-    r")",
-    re.IGNORECASE,
-)
-
-# Strong claims — phrases the model only produces when it's
-# fabricating a tool-call report. These trigger detection ALONE,
-# without needing an action verb in the user's message. Legit
-# replies never contain these unless a tool actually ran.
-_MODEL_CLAIM_STRONG_RE = re.compile(
-    r"("
-    # Direct fabrications about caput calls
-    r"\bcaput(?:s|ed|ted|'d)?\s+(?:fired|firing|written|sent|"
-    r"succeeded|OK|done|this\s+turn)|"
-    r"\bfired?\s+(?:the\s+)?caput|"
-    r"\bfired\s+both\b|"
-    r"\bfiring\s+caputs?|"
-    r"\bwrote\s+to\b|"
-    r"\bverified\s+(?:via|after|with)\s+(?:rbv|caput)|"
-    r"\bverified\s+by\s+rbv|"
-    r"\brbv\s+verified|"
-    r"\bdmov\s*=\s*1|"
-    r"\brbv\s*=|"
-    r"\battempts?\s+succeeded|"
-    r"\bmove\s+(?:issued|fired|committed)|"
-    r"\bboth\s+at\s+[\-+0-9]|"
-    # Terse state-transition claims — "Started", "Stopped",
-    # "Restarted" as their own reply. These are the exact
-    # phrases the model produces when it fabricates a caput
-    # to Acquire / any binary PV. Live incident 2026-08-20:
-    # "Started — `Acquire`=1 confirmed." with no tool_call.
-    r"^\s*started\b|^\s*stopped\b|^\s*restarted\b|"
-    # "<var>=N confirmed" — the pattern from the same incident
-    r"[a-z_`'\"][a-z_0-9.]*[`'\"]?\s*=\s*[\-+0-9][\-+0-9.eE]*\s+confirmed|"
-    r"\bconfirmed\s+by\s+(?:caput|rbv|the\s+return)|"
-    r"\bcaput\s+return\b|"
-    # "Actually sending / firing / invoking X" — model
-    # promises the action but emits no tool_call. Live
-    # incident: "Retrying — actually sending caput …"
-    r"\bactually\s+(?:sending|firing|invoking|calling|running|"
-    r"executing|writing|caputting|issuing)\b|"
-    r"\bfor\s+real\s+this\s+time\b|"
-    r"\bthis\s+time\s+for\s+real\b|"
-    # Infrastructure fabrication — hostnames, gateways, IPs,
-    # architecture claims the model invents to explain away a
-    # missing tool call.
-    r"\b(?:host|hostname)\s*(?::|is|=)\s*[a-z0-9][a-z0-9.\-]*|"
-    r"\bepics[\s_]*gateway\s*(?::|=)|"
-    r"\bca[\s_]*gateway\s*(?::|=)|"
-    r"\b(?:runs?|running)\s+on\s+[a-z][a-z0-9.\-]*(?:\.aps\.anl\.gov)?|"
-    r"\bsshes?\s+(?:in)?to\s+[a-z]|"
-    r"\bsplit\s+architecture|"
-    r"\bagent\s+(?:runtime|backend)\s+(?:on|is\s+on)\s+[a-z]|"
-    r"\bfrom\s+(?:txm[0-9]+|tomo[0-9]+|gauss|hulk|beams|s32[a-z0-9]*):"
-    r")",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def _is_action_hallucination(user_text: str,
-                              reply_text: str,
-                              tools_called_this_turn: int) -> bool:
-    """Return True when the model returned an action-claim reply
-    without having invoked any tool this turn.
-
-    Detection has two tiers:
-      * STRONG claim — the reply contains a phrase the model only
-        produces when fabricating a tool-call report ("caput fired",
-        "DMOV=1", "verified via RBV", "Both at 1.0"). Triggers alone.
-      * WEAK claim — a general past-tense verb ("moved to 1", "done")
-        that could appear in a legit reply. Requires the user's own
-        message to have implied an action too."""
-    if tools_called_this_turn > 0:
-        return False
-    if not reply_text:
-        return False
-    # Strong claims trigger regardless of the user's phrasing —
-    # legit replies to non-action questions don't contain them.
-    if _MODEL_CLAIM_STRONG_RE.search(reply_text):
-        return True
-    # Weak claims need a matching user-side action verb.
-    if not _USER_ACTION_RE.search(user_text or ""):
-        return False
-    return bool(_MODEL_CLAIM_WEAK_RE.search(reply_text))
-
-
-_HALLUCINATION_CORRECTION = (
-    "AGENT-LOOP GUARD: Your previous reply claims an action was "
-    "performed (\"{claim_snippet}\") but you did NOT invoke any "
-    "tool this turn. Text-only replies do nothing on this system — "
-    "the beamline / motor / plot / file only changes when you emit "
-    "a tool_call. This is not a permission or config problem; it "
-    "is a hallucination pattern seen in your reply. RETRY NOW: "
-    "call the appropriate tool (caput / bash / open_beamline_plugin "
-    "/ etc.) BEFORE writing any text. Do not include the words "
-    "\"done\", \"fired\", \"verified\", or similar until AFTER you "
-    "receive a tool_result confirming success. If your claim was "
-    "about infrastructure (hostname, host, EPICS gateway, "
-    "\"runs on X\", \"SSHes to Y\"), you fabricated it — the only "
-    "way to know a hostname is `bash: hostname`, an EPICS gateway "
-    "is `bash: echo $EPICS_CA_ADDR_LIST`, etc. Call the tool."
-)
-
-_HALLUCINATION_BANNER = (
-    "⚠️ AGENT-LOOP GUARD: the reply below was flagged as a "
-    "hallucination — the model claimed an action but did not "
-    "actually invoke any tool. The claim may be false. Nothing "
-    "was written to the beamline, no file was produced, no PV "
-    "was changed. Re-issue your request or check the Console for "
-    "actual tool activity this turn."
-)
-
-
-def _hallucination_snippet(reply_text: str, limit: int = 80) -> str:
-    """Trim a reply for the correction message so we don't feed the
-    whole hallucinated paragraph back to the model."""
-    t = (reply_text or "").strip().replace("\n", " ")
-    if len(t) <= limit:
-        return t
-    return t[:limit] + "…"
+# The former regex "hallucination guard" (2026-08-20 incident) has been
+# removed. It was post-hoc: it caught SOME fabrications after they
+# happened, false-positived on legit replies containing "done" / a
+# hostname / "started", and burned iterations. The underlying cause
+# was scaffolding — no temperature, no thinking budget, a defensive
+# system prompt, and a 10-iteration cap encouraging shortcuts. Loop
+# tuning (temperature=0.2, extended thinking, higher max_tokens, cap
+# raised to 100) plus a tool-first system prompt make the guard
+# unnecessary. The "only claim an action after a successful tool_call"
+# rule now lives in the beamline_operator specialist prompt where the
+# risk actually exists (the orchestrator no longer touches hardware).
 
 
 # ── provider-agnostic tool loop ─────────────────────────────────────────
@@ -762,6 +599,27 @@ def _hallucination_snippet(reply_text: str, limit: int = 80) -> str:
 # (API shape, response walking, message formats) are delegated to a
 # `_ProviderAdapter`. Adding a new backend is a new adapter, not a new
 # loop copy.
+
+# Loop-tuning defaults. Extended thinking is enabled on Anthropic
+# models known to support it (see `_supports_thinking`). When thinking
+# is on, Anthropic requires temperature=1; the tuned `temperature`
+# below applies only when thinking is off.
+DEFAULT_MAX_TOKENS = 16384
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_THINKING_BUDGET = 8000
+
+
+def _supports_thinking(model: str) -> bool:
+    """True for Anthropic models known to support extended thinking.
+    Conservative allow-list: Sonnet 4+, Opus 4+, Haiku 4.5+, Fable 5+.
+    Older 3.x families (and unknown/proxied model ids) default to False."""
+    if not model:
+        return False
+    return bool(re.search(
+        r"claude-(sonnet|opus|haiku|fable)-[4-9](?:[-.]|$)",
+        model.lower(),
+    ))
+
 
 class _ProviderAdapter:
     """Provider-specific parts of one agentic turn. Every method is
@@ -805,10 +663,6 @@ class _ProviderAdapter:
         """Append all this round's tool_result payloads to messages."""
         raise NotImplementedError
 
-    def append_hallucination_correction(self, messages, response, text, correction):
-        """Append an assistant-then-user pair to prompt a corrected retry."""
-        raise NotImplementedError
-
 
 class ToolRunner:
     """One agentic turn: send → maybe tool_use → repeat until final text
@@ -817,23 +671,18 @@ class ToolRunner:
     the turn (so tool-heavy turns bill correctly)."""
 
     def __init__(self, *, adapter, tool_ctx, emit_tool, confirm,
-                 max_iterations=None, hallucination_max_retries=None):
+                 max_iterations=None):
         self.adapter = adapter
         self.tool_ctx = tool_ctx
         self.emit_tool = emit_tool
         self.confirm = confirm
         self.max_iterations = (
             MAX_AGENT_ITERATIONS if max_iterations is None else max_iterations)
-        self.hallucination_max_retries = (
-            HALLUCINATION_MAX_RETRIES if hallucination_max_retries is None
-            else hallucination_max_retries)
 
     def run(self, system_prompt, history, user_text):
         adapter = self.adapter
         messages = adapter.initial_messages(system_prompt, history, user_text)
         totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-        tools_called_this_turn = 0
-        hallucination_retries = 0
 
         for _ in range(self.max_iterations):
             response = adapter.call(system_prompt, messages)
@@ -842,36 +691,11 @@ class ToolRunner:
 
             tool_calls = adapter.extract_tool_calls(response)
             if not tool_calls:
-                text = adapter.extract_text(response)
-                # Hallucination guard — see the section-header comment above
-                # `_is_action_hallucination` for the incident this fixes.
-                if _is_action_hallucination(
-                        user_text, text, tools_called_this_turn):
-                    if hallucination_retries < self.hallucination_max_retries:
-                        hallucination_retries += 1
-                        LOGGER.warning(
-                            "hallucinated action reply (retry %d/%d): %r",
-                            hallucination_retries,
-                            self.hallucination_max_retries,
-                            text[:120])
-                        correction = _HALLUCINATION_CORRECTION.format(
-                            claim_snippet=_hallucination_snippet(text))
-                        adapter.append_hallucination_correction(
-                            messages, response, text, correction)
-                        continue
-                    # Retries exhausted — prepend a clear warning so the
-                    # user sees "this reply is fabricated" instead of
-                    # trusting the fake success message.
-                    LOGGER.error(
-                        "hallucination guard exhausted; delivering reply "
-                        "with warning banner: %r", text[:120])
-                    return _HALLUCINATION_BANNER + "\n\n" + text, totals
-                return text, totals
+                return adapter.extract_text(response), totals
 
             # Append the assistant's content (text + tool_use blocks) verbatim,
             # then run each tool and feed results back.
             adapter.append_assistant_turn(messages, response)
-            tools_called_this_turn += len(tool_calls)
             tool_results = []
             for tc in tool_calls:
                 name = adapter.tool_call_name(tc)
@@ -889,28 +713,52 @@ class ToolRunner:
 
 class _AnthropicAdapter(_ProviderAdapter):
     """Anthropic Messages API adapter. Uses tool_use / tool_result blocks
-    and packages every tool round's results into a single user turn."""
+    and packages every tool round's results into a single user turn.
 
-    def __init__(self, client, model, tools):
+    Enables extended thinking on models that support it — the model
+    reasons privately in a `thinking` block before answering, which
+    cuts the "shortcut to a fake answer" failure mode where the model
+    generates a plausible-looking action claim instead of invoking the
+    tool. Thinking blocks arrive in `response.content` and are
+    preserved verbatim on follow-up calls (Anthropic requires this)."""
+
+    def __init__(self, client, model, tools, *,
+                 max_tokens=DEFAULT_MAX_TOKENS,
+                 temperature=DEFAULT_TEMPERATURE,
+                 thinking_budget=DEFAULT_THINKING_BUDGET):
         self.client = client
         self.model = model
         self.tools = tools
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.thinking_budget = (
+            thinking_budget if _supports_thinking(model) else 0)
 
     def initial_messages(self, system_prompt, history, user_text):
         return [*history, {"role": "user", "content": user_text}]
 
     def call(self, system_prompt, messages):
-        return self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=[{
+        params = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": [{
                 "type": "text",
                 "text": system_prompt,
                 "cache_control": {"type": "ephemeral"},
             }],
-            tools=self.tools,
-            messages=messages,
-        )
+            "tools": self.tools,
+            "messages": messages,
+        }
+        if self.thinking_budget > 0:
+            # Anthropic requires temperature=1 when thinking is enabled.
+            params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self.thinking_budget,
+            }
+            params["temperature"] = 1.0
+        else:
+            params["temperature"] = self.temperature
+        return self.client.messages.create(**params)
 
     def extract_usage(self, response):
         u = response.usage
@@ -928,6 +776,8 @@ class _AnthropicAdapter(_ProviderAdapter):
                 if getattr(b, "type", None) == "tool_use"]
 
     def extract_text(self, response):
+        # Thinking blocks are filtered out here — they're the model's
+        # private reasoning and never rendered to the user.
         return "".join(
             b.text for b in response.content
             if getattr(b, "type", None) == "text"
@@ -937,6 +787,10 @@ class _AnthropicAdapter(_ProviderAdapter):
     def tool_call_args(self, tool_call): return tool_call.input
 
     def append_assistant_turn(self, messages, response):
+        # `response.content` may contain thinking blocks alongside text /
+        # tool_use — we keep it verbatim because Anthropic requires the
+        # thinking blocks (with signatures) to be echoed back for
+        # subsequent turns to work when extended thinking is enabled.
         messages.append({"role": "assistant", "content": response.content})
 
     def format_tool_result(self, tool_call, result):
@@ -949,24 +803,24 @@ class _AnthropicAdapter(_ProviderAdapter):
     def append_tool_results(self, messages, tool_results):
         messages.append({"role": "user", "content": tool_results})
 
-    def append_hallucination_correction(self, messages, response, text, correction):
-        # Feed the model back a user-role correction. Anthropic models handle
-        # a plain user message here; the previous assistant text stays in
-        # context so the model can see what it claimed vs. what it should
-        # have done.
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": correction})
-
 
 class _OpenAIAdapter(_ProviderAdapter):
     """OpenAI Chat Completions adapter. Emits one `role: tool` message per
     tool call and preserves the model's `tool_calls` array on the
-    assistant turn so the follow-up references match."""
+    assistant turn so the follow-up references match.
 
-    def __init__(self, client, model, tools):
+    No extended-thinking equivalent — OpenAI's o1/o3 use `reasoning_effort`
+    on a different endpoint, so the tuning here is just temperature and
+    a higher output cap."""
+
+    def __init__(self, client, model, tools, *,
+                 max_tokens=DEFAULT_MAX_TOKENS,
+                 temperature=DEFAULT_TEMPERATURE):
         self.client = client
         self.model = model
         self.tools = tools
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         self._last_msg = None  # cache to avoid re-walking .choices[0]
 
     def initial_messages(self, system_prompt, history, user_text):
@@ -979,7 +833,7 @@ class _OpenAIAdapter(_ProviderAdapter):
     def call(self, system_prompt, messages):
         response = self.client.chat.completions.create(
             model=self.model, messages=messages, tools=self.tools,
-            max_tokens=4096,
+            max_tokens=self.max_tokens, temperature=self.temperature,
         )
         self._last_msg = response.choices[0].message
         return response
@@ -1032,10 +886,6 @@ class _OpenAIAdapter(_ProviderAdapter):
 
     def append_tool_results(self, messages, tool_results):
         messages.extend(tool_results)
-
-    def append_hallucination_correction(self, messages, response, text, correction):
-        messages.append({"role": "assistant", "content": text})
-        messages.append({"role": "user", "content": correction})
 
 
 # ── chat: Anthropic protocol ────────────────────────────────────────────
