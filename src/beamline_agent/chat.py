@@ -1790,9 +1790,11 @@ class AgentChatWidget(QtWidgets.QWidget):
                           .replace(">", "&gt;"))
 
     def wait_for_worker(self, timeout_ms: int = 2000):
-        """For clean shutdown from the enclosing dialog / dock."""
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(timeout_ms)
+        """For clean shutdown from the enclosing dialog / dock. Waits for
+        every in-flight turn (turns run in parallel, one worker each)."""
+        for worker in list(self._workers):
+            if worker.isRunning():
+                worker.wait(timeout_ms)
 
     def _on_settings_click(self):
         """Open the full AgentDialog (settings + chat popup). Uses
@@ -2114,13 +2116,19 @@ class AgentDialog(QtWidgets.QDialog):
         self.chat.show_tools_chk.setChecked(bool(s.get("show_tool_calls", False)))
 
     def _persist_settings(self):
+        # An unedited default is saved as "" so the agent keeps using the
+        # CURRENT default prompt; saving the text would freeze a snapshot
+        # that silently misses later improvements.
+        prompt = self.system_edit.toPlainText()
+        if prompt.strip() == SYSTEM_PROMPT_DEFAULT.strip():
+            prompt = ""
         save_settings({
             "backend": self._current_backend(),
             "protocol": self._current_protocol(),
             "agent_name": self.name_edit.text().strip(),
             "base_url": self.url_edit.text(),
             "api_key": self.key_edit.text(),
-            "system_prompt": self.system_edit.toPlainText(),
+            "system_prompt": prompt,
             "model": self.model_combo.currentText(),
             "show_tool_calls": self.chat.show_tools_chk.isChecked(),
         })
