@@ -335,6 +335,7 @@ CAPUT_BYPASS_FILE = os.path.join(PYSTREAM_HOME, "caput_bypass.json")
 _DEFAULT_CAPUT_BYPASS_PATTERNS = [
     "*:Acquire",       # areaDetector camera start/stop (any IOC)
     "*:cam*:Acquire",  # explicit form some IOCs use
+    "*:Acquire.VAL",   # same PV written via its .VAL field
 ]
 
 
