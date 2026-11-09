@@ -485,19 +485,6 @@ SYSTEM_PROMPT_DEFAULT = """You are {name}, the AI orchestrator for APS
 beamline {beamline}. The on-shift scientist is the user; the beamline
 is the machine you help them run.
 
-# HOW YOU WORK
-
-Tools are how anything happens on this system. If you have not
-successfully invoked a tool this turn, nothing has changed — no motor
-moved, no file was written, no PV updated, no plot rendered. A text
-reply describing an action, without a matching tool_call that
-succeeded, is a fabrication. Do not produce one. Ever.
-
-Before writing any past-tense claim ("moved to 1.0", "started",
-"restarted the IOC", "wrote the file"), verify you received a
-tool_result in this turn that shows it succeeded. If you didn't, call
-the tool now — before the text.
-
 For anything non-trivial, plan first: what tool(s), in what order,
 what result each will produce. Then execute. Then verify. Then
 answer.
@@ -534,6 +521,31 @@ lightweight, cross-cutting, or exploratory work yourself.
   the rest.
 
 {beamline_addendum}
+"""
+
+
+# Appended to EVERY system prompt — default or user-saved — and to every
+# sub-agent prompt. A saved custom prompt sets persona and tone; it must
+# not be able to silently drop these rules (a stale custom prompt on the
+# beamline account did exactly that, and the agent reported an IOC as
+# "started" because a launcher script returned 0).
+CORE_RULES = """# TRUTHFULNESS (always applies)
+
+Tools are how anything happens. If no tool call succeeded this turn,
+nothing changed — no motor moved, no IOC started, no PV written, no
+file read.
+
+A tool returning success means the request was ACCEPTED, not that the
+outcome happened. Starting, launching, moving and writing can all be
+accepted while the thing still isn't running or hasn't arrived. Before
+saying something is started / running / moved / set, read the end
+state back with a read-only tool (ioc_status, read_motor, read_pv,
+check_detector_stream) and report what you read. If you could not
+verify it, say so plainly: "sent, not verified".
+
+Never describe an action you did not perform, and never claim to have
+looked at a file, script or page you did not read with a tool in this
+conversation. If you don't know, call a tool or ask.
 """
 
 
@@ -630,9 +642,8 @@ def _openai_tool_result_text(result):
 # system prompt, and a 10-iteration cap encouraging shortcuts. Loop
 # tuning (temperature=0.2, extended thinking, higher max_tokens, cap
 # raised to 100) plus a tool-first system prompt make the guard
-# unnecessary. The "only claim an action after a successful tool_call"
-# rule now lives in the beamline_operator specialist prompt where the
-# risk actually exists (the orchestrator no longer touches hardware).
+# unnecessary. The "only claim an action after a verified tool_result"
+# rule lives in CORE_RULES, appended to every main and sub-agent prompt.
 
 
 # ── provider-agnostic tool loop ─────────────────────────────────────────
@@ -1518,10 +1529,16 @@ class AgentChatWidget(QtWidgets.QWidget):
         addendum = tool_ctx.get("system_prompt_addendum", "") or ""
         prompt = (
             (s.get("system_prompt") or SYSTEM_PROMPT_DEFAULT)
-            .replace("{name}",              name)
-            .replace("{beamline}",          _active_beamline())
-            .replace("{beamline_addendum}", addendum)
+            .replace("{name}",     name)
+            .replace("{beamline}", _active_beamline())
         )
+        if "{beamline_addendum}" in prompt:
+            prompt = prompt.replace("{beamline_addendum}", addendum)
+        elif addendum:
+            # A saved custom prompt without the placeholder used to drop
+            # the beamline rules (IOC handling, PV cheat sheet, …) entirely.
+            prompt = prompt.rstrip() + "\n\n" + addendum
+        prompt = prompt.rstrip() + "\n\n" + CORE_RULES
         return {
             "protocol":      s.get("protocol", PROTOCOL_ANTHROPIC),
             "url":           url,

@@ -103,7 +103,7 @@ SUBAGENT_KINDS: dict[str, dict] = {
             "bash", "read_file",
             "read_pv", "caput",
             "read_motor", "check_motor_health", "check_pv_health",
-            "check_detector_stream", "ioc_status",
+            "check_detector_stream", "ioc_status", "ioc_action", "list_iocs",
             "list_docs", "read_doc", "search_docs",
             "open_beamline_plugin", "list_beamline_plugins",
             "view_hdf5_file",
@@ -188,11 +188,12 @@ def tool_spawn_subagent(kind: str, task: str) -> dict:
 
     # ── build the sub-agent's system prompt ──
     doc_text = _read_doc(preset["doc_path"])
+    from .chat import CORE_RULES
     system_prompt = _SUBAGENT_PROMPT_TEMPLATE.format(
         task=task.strip(),
         purpose=preset["purpose"],
         doc=doc_text,
-    )
+    ).rstrip() + "\n\n" + CORE_RULES
 
     # ── build the sub-agent's tool subset from the parent's catalog ──
     allowed = set(preset.get("tool_names") or [])
