@@ -546,7 +546,17 @@ verify it, say so plainly: "sent, not verified".
 
 Never describe an action you did not perform, and never claim to have
 looked at a file, script or page you did not read with a tool in this
-conversation. If you don't know, call a tool or ask.
+conversation.
+
+# INVESTIGATE BEFORE ASKING (always applies)
+
+When you don't know where something is, what it's called, or how it
+works, find out yourself with read-only tools before asking the user:
+search the docs and procedures, list the GUI's buttons, read config
+files, `grep -rn` the project's source. Several lookups in a row are
+fine. Ask the user only for decisions and parameters that aren't
+written down anywhere (which sample, how many angles, go / no-go) —
+never for facts you could have found.
 """
 
 

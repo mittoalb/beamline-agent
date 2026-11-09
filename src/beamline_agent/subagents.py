@@ -104,6 +104,8 @@ SUBAGENT_KINDS: dict[str, dict] = {
             "read_pv", "caput",
             "read_motor", "check_motor_health", "check_pv_health",
             "check_detector_stream", "ioc_status", "ioc_action", "list_iocs",
+            "list_bl_gui_displays", "open_bl_gui_display",
+            "tomoscan_status", "tomoscan_start", "tomoscan_abort",
             "list_docs", "read_doc", "search_docs",
             "open_beamline_plugin", "list_beamline_plugins",
             "view_hdf5_file",
