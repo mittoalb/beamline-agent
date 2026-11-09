@@ -744,10 +744,20 @@ class ToolRunner:
         self.max_iterations = (
             MAX_AGENT_ITERATIONS if max_iterations is None else max_iterations)
 
-    def run(self, system_prompt, history, user_text):
+    def run(self, system_prompt, history, user_text, turn_sink=None):
+        """Run one turn. If `turn_sink` is a list, it is extended with
+        every message this turn produced — the user message, each
+        assistant tool_use turn, each tool_result batch, and the final
+        assistant reply — so the caller can keep the tool evidence in
+        history instead of only the final prose."""
         adapter = self.adapter
         messages = adapter.initial_messages(system_prompt, history, user_text)
+        turn_start = len(messages) - 1  # index of this turn's user message
         totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+
+        def _flush():
+            if turn_sink is not None:
+                turn_sink.extend(messages[turn_start:])
 
         for _ in range(self.max_iterations):
             response = adapter.call(system_prompt, messages)
@@ -756,6 +766,8 @@ class ToolRunner:
 
             tool_calls = adapter.extract_tool_calls(response)
             if not tool_calls:
+                adapter.append_assistant_turn(messages, response)
+                _flush()
                 return adapter.extract_text(response), totals
 
             # Append the assistant's content (text + tool_use blocks) verbatim,
@@ -772,8 +784,12 @@ class ToolRunner:
                 tool_results.append(adapter.format_tool_result(tc, result))
             adapter.append_tool_results(messages, tool_results)
 
-        return ("(stopped: hit MAX_AGENT_ITERATIONS — too many tool calls)",
-                totals)
+        stopped = "(stopped: hit MAX_AGENT_ITERATIONS — too many tool calls)"
+        # Close the turn on an assistant message so the recorded history
+        # stays a valid alternation for the next request.
+        messages.append({"role": "assistant", "content": stopped})
+        _flush()
+        return stopped, totals
 
 
 class _AnthropicAdapter(_ProviderAdapter):
@@ -814,7 +830,7 @@ class _AnthropicAdapter(_ProviderAdapter):
                 "cache_control": {"type": "ephemeral"},
             }],
             "tools": self.tools,
-            "messages": messages,
+            "messages": _with_cache_breakpoint(messages),
         }
         if self.thinking_budget > 0:
             # Two thinking API shapes coexist in the Anthropic model
@@ -947,18 +963,19 @@ class _OpenAIAdapter(_ProviderAdapter):
 
     def append_assistant_turn(self, messages, response):
         msg = self._last_msg
-        messages.append({
-            "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [{
+        entry = {"role": "assistant", "content": msg.content}
+        # Final replies carry no tool_calls; an empty list is rejected
+        # by some OpenAI-compatible servers, so omit the key entirely.
+        if msg.tool_calls:
+            entry["tool_calls"] = [{
                 "id": tc.id,
                 "type": "function",
                 "function": {
                     "name": tc.function.name,
                     "arguments": tc.function.arguments,
                 },
-            } for tc in msg.tool_calls],
-        })
+            } for tc in msg.tool_calls]
+        messages.append(entry)
 
     def format_tool_result(self, tool_call, result):
         return {
@@ -971,27 +988,186 @@ class _OpenAIAdapter(_ProviderAdapter):
         messages.extend(tool_results)
 
 
+# ── history: keep the tool evidence across turns ────────────────────────
+#
+# Each turn is stored as the full message sequence it produced (user
+# text → assistant tool_use → tool_result → … → final assistant), not
+# just the final prose. Without the tool_results the model on the next
+# turn only sees its own past claims ("moved ZP X to 1.0") with no
+# record of what actually happened — so it could neither recall values
+# nor tell a real action from a stated one.
+
+_HISTORY_TOOL_RESULT_MAX_CHARS = 4000   # per tool_result kept in history
+_HISTORY_MAX_CHARS = 200_000            # whole-history budget (~50K tokens)
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…[{len(text) - limit} chars truncated in history]"
+
+
+def _compact_tool_result_content(content):
+    """Shrink a tool_result payload for later turns: images are dropped
+    (they would be re-sent on every request) and long text is cut."""
+    if isinstance(content, str):
+        return _truncate(content, _HISTORY_TOOL_RESULT_MAX_CHARS)
+    if isinstance(content, list):
+        out = []
+        for blk in content:
+            btype = blk.get("type") if isinstance(blk, dict) else None
+            if btype == "image":
+                out.append({"type": "text", "text": "[image omitted from history]"})
+            elif btype == "text":
+                out.append({"type": "text", "text": _truncate(
+                    blk.get("text", ""), _HISTORY_TOOL_RESULT_MAX_CHARS)})
+            else:
+                out.append(blk)
+        return out
+    return content
+
+
+def _block_to_dict(blk):
+    """Anthropic content block (SDK object or dict) → plain dict, or None
+    to drop it. Thinking blocks are only needed inside the live tool
+    loop, so later turns don't carry them."""
+    if isinstance(blk, dict):
+        get = blk.get
+    else:
+        def get(key, default=None):
+            return getattr(blk, key, default)
+    btype = get("type")
+    if btype == "text":
+        text = get("text") or ""
+        return {"type": "text", "text": text} if text.strip() else None
+    if btype == "tool_use":
+        return {"type": "tool_use", "id": get("id"),
+                "name": get("name"), "input": get("input") or {}}
+    if btype == "tool_result":
+        out = {"type": "tool_result", "tool_use_id": get("tool_use_id"),
+               "content": _compact_tool_result_content(get("content"))}
+        if get("is_error"):
+            out["is_error"] = True
+        return out
+    return None
+
+
+def _to_history_message(msg: dict) -> dict:
+    """One message from a finished turn → JSON-safe, compacted dict."""
+    role, content = msg.get("role"), msg.get("content")
+    if role == "tool":  # OpenAI tool result
+        return {"role": "tool", "tool_call_id": msg.get("tool_call_id"),
+                "content": _truncate(str(content or ""),
+                                     _HISTORY_TOOL_RESULT_MAX_CHARS)}
+    if content is None or isinstance(content, str):
+        out = {"role": role,
+               "content": content if msg.get("tool_calls") else (content or "")}
+        if msg.get("tool_calls"):
+            out["tool_calls"] = msg["tool_calls"]
+        return out
+    blocks = [b for b in (_block_to_dict(x) for x in content) if b is not None]
+    return {"role": role,
+            "content": blocks or [{"type": "text", "text": "(no text)"}]}
+
+
+def _is_turn_start(msg: dict) -> bool:
+    """A turn starts at a plain-text user message (tool_result batches
+    are user-role too, but carry a list)."""
+    return msg.get("role") == "user" and isinstance(msg.get("content"), str)
+
+
+def _trim_history(history: list, max_turns: int,
+                  max_chars: int = _HISTORY_MAX_CHARS) -> list:
+    """Keep the newest whole turns within both limits. Cuts only at turn
+    starts, so a tool_use is never separated from its tool_result. The
+    newest turn is always kept."""
+    starts = [i for i, m in enumerate(history) if _is_turn_start(m)]
+    if not starts:
+        return []
+    sizes = [len(json.dumps(m, default=str)) for m in history]
+    ends = starts[1:] + [len(history)]
+    keep_from, total, turns = starts[-1], 0, 0
+    for s, e in reversed(list(zip(starts, ends))):
+        seg = sum(sizes[s:e])
+        if turns and (turns >= max_turns or total + seg > max_chars):
+            break
+        total += seg
+        turns += 1
+        keep_from = s
+    return history[keep_from:]
+
+
+def _flatten_history(history: list) -> list:
+    """Reduce history to plain user/assistant text pairs — valid for any
+    protocol. Used when the active protocol differs from the one the
+    history was recorded with."""
+    out: list[dict] = []
+    for m in history:
+        if _is_turn_start(m):
+            if out and out[-1]["role"] == "user":
+                out.append({"role": "assistant", "content": "(no text reply)"})
+            out.append({"role": "user", "content": m["content"]})
+        elif m.get("role") == "assistant" and out:
+            c = m.get("content")
+            text = c if isinstance(c, str) else "".join(
+                b.get("text", "") for b in (c or [])
+                if isinstance(b, dict) and b.get("type") == "text")
+            if not (text or "").strip():
+                continue
+            if out[-1]["role"] == "assistant":
+                out[-1]["content"] += "\n" + text
+            else:
+                out.append({"role": "assistant", "content": text})
+    while out and out[-1]["role"] == "user":
+        out.pop()
+    return out
+
+
+def _with_cache_breakpoint(messages: list) -> list:
+    """Return a copy of `messages` with a prompt-cache breakpoint on the
+    last block, so the growing conversation is cached between the many
+    requests of a tool-heavy turn. Never mutates the caller's list, so
+    breakpoints don't accumulate past the API's limit of four."""
+    if not messages or not isinstance(messages[-1], dict):
+        return messages
+    last = messages[-1]
+    content = last.get("content")
+    marker = {"type": "ephemeral"}
+    if isinstance(content, str) and content:
+        new_content = [{"type": "text", "text": content, "cache_control": marker}]
+    elif (isinstance(content, list) and content and isinstance(content[-1], dict)
+          and content[-1].get("type") in ("text", "tool_result", "image")):
+        new_content = [*content[:-1], {**content[-1], "cache_control": marker}]
+    else:
+        return messages
+    return [*messages[:-1], {**last, "content": new_content}]
+
+
 # ── chat: Anthropic protocol ────────────────────────────────────────────
 
 def _chat_anthropic(base_url, api_key, model, system_prompt,
-                    history, user_text, emit_tool, confirm, tool_ctx):
+                    history, user_text, emit_tool, confirm, tool_ctx,
+                    max_iterations=None, turn_sink=None):
     """Agentic loop on the Anthropic Messages API. `emit_tool` is a callback
     `(name, arguments, result_or_None) -> None` invoked once at call-start
-    (result=None) and once at completion."""
+    (result=None) and once at completion. `turn_sink`, if a list, receives
+    every message this turn produced (user, tool_use, tool_result, final)."""
     import anthropic
     client = anthropic.Anthropic(base_url=base_url, api_key=api_key,
                                  timeout=60.0, max_retries=2)
     tools = tool_ctx.get("tool_specs_anthropic", []) or []
     adapter = _AnthropicAdapter(client, model, tools)
     runner = ToolRunner(adapter=adapter, tool_ctx=tool_ctx,
-                        emit_tool=emit_tool, confirm=confirm)
-    return runner.run(system_prompt, history, user_text)
+                        emit_tool=emit_tool, confirm=confirm,
+                        max_iterations=max_iterations)
+    return runner.run(system_prompt, history, user_text, turn_sink=turn_sink)
 
 
 # ── chat: OpenAI protocol ───────────────────────────────────────────────
 
 def _chat_openai(base_url, api_key, model, system_prompt,
-                 history, user_text, emit_tool, confirm, tool_ctx):
+                 history, user_text, emit_tool, confirm, tool_ctx,
+                 max_iterations=None, turn_sink=None):
     """Agentic loop on OpenAI Chat Completions.
 
     ``api_key`` may be empty when talking to a local OpenAI-compatible
@@ -1004,8 +1180,9 @@ def _chat_openai(base_url, api_key, model, system_prompt,
     tools = tool_ctx.get("tool_specs_openai", []) or []
     adapter = _OpenAIAdapter(client, model, tools)
     runner = ToolRunner(adapter=adapter, tool_ctx=tool_ctx,
-                        emit_tool=emit_tool, confirm=confirm)
-    return runner.run(system_prompt, history, user_text)
+                        emit_tool=emit_tool, confirm=confirm,
+                        max_iterations=max_iterations)
+    return runner.run(system_prompt, history, user_text, turn_sink=turn_sink)
 
 
 # ── worker thread ───────────────────────────────────────────────────────
@@ -1014,7 +1191,7 @@ class _ChatWorker(QtCore.QThread):
     """Throwaway worker — one chat turn per instance. Emits tool_event for
     every tool call so the dialog can render it live."""
 
-    done = pyqtSignal(str, dict)            # (assistant_text, usage_dict)
+    done = pyqtSignal(str, dict, object)    # (assistant_text, usage, turn_messages)
     error = pyqtSignal(str)
     tool_event = pyqtSignal(str, dict, object)  # (name, args, result-or-None)
 
@@ -1069,22 +1246,25 @@ class _ChatWorker(QtCore.QThread):
         WORKER_CTX.confirm    = self._confirm
         WORKER_CTX.gui_action = self._gui_action_helper
         try:
+            turn: list = []
             if self.protocol == PROTOCOL_ANTHROPIC:
                 text, usage = _chat_anthropic(
                     self.base_url, self.api_key, self.model,
                     self.system_prompt, self.history, self.user_text,
                     self._emit_tool, self._confirm, self.tool_ctx,
+                    turn_sink=turn,
                 )
             elif self.protocol == PROTOCOL_OPENAI:
                 text, usage = _chat_openai(
                     self.base_url, self.api_key, self.model,
                     self.system_prompt, self.history, self.user_text,
                     self._emit_tool, self._confirm, self.tool_ctx,
+                    turn_sink=turn,
                 )
             else:
                 self.error.emit(f"unknown protocol: {self.protocol!r}")
                 return
-            self.done.emit(text, usage)
+            self.done.emit(text, usage, turn)
         except ImportError as ex:
             self.error.emit(f"SDK not installed: {ex}")
         except Exception as ex:
@@ -1145,6 +1325,10 @@ class AgentChatWidget(QtWidgets.QWidget):
         nothing so it starts fresh each open."""
         super().__init__(parent)
         self._history: list[dict] = []
+        # Protocol the structured history was recorded in (tool_use blocks
+        # differ between Anthropic and OpenAI). None = plain text only,
+        # which every protocol accepts.
+        self._history_protocol: Optional[str] = None
         # Concurrent turns — Send button stays enabled; each Send spawns
         # a new _ChatWorker onto its own QThread. We track live workers
         # in a set so they stay owned (Qt would otherwise garbage-
@@ -1192,7 +1376,7 @@ class AgentChatWidget(QtWidgets.QWidget):
             self._status_pub = None
 
     # ── History persistence ─────────────────────────────────────────
-    _HISTORY_MAX_TURNS = 100   # user+assistant pairs; caps unbounded growth
+    _HISTORY_MAX_TURNS = 100   # whole turns; size is also capped by _HISTORY_MAX_CHARS
 
     def _history_path(self) -> Optional[str]:
         if not self._persist_id:
@@ -1213,14 +1397,17 @@ class AgentChatWidget(QtWidgets.QWidget):
             with open(path) as f:
                 data = json.load(f)
             self._history = list(data.get("history") or [])
+            self._history_protocol = data.get("history_protocol")
             html = data.get("transcript_html") or ""
             if html:
                 self.transcript.setHtml(html)
+                n_turns = sum(1 for m in self._history if _is_turn_start(m))
                 self.status_label.setText(
-                    f"restored {len(self._history)//2} turn(s) from previous session")
+                    f"restored {n_turns} turn(s) from previous session")
                 self._scroll_transcript_to_bottom()
         except Exception:
             self._history = []
+            self._history_protocol = None
 
     def _scroll_transcript_to_bottom(self) -> None:
         """Force the transcript view to the last message. Called after
@@ -1248,14 +1435,13 @@ class AgentChatWidget(QtWidgets.QWidget):
             return
         try:
             os.makedirs(PYSTREAM_HOME, exist_ok=True)
-            # Trim oldest turns; each turn is 2 messages (user + assistant)
-            keep = self._HISTORY_MAX_TURNS * 2
-            trimmed = self._history[-keep:] if len(self._history) > keep else self._history
+            trimmed = _trim_history(self._history, self._HISTORY_MAX_TURNS)
             with open(path, "w") as f:
                 json.dump({
-                    "history":         trimmed,
-                    "transcript_html": self.transcript.toHtml(),
-                }, f, indent=2)
+                    "history":          trimmed,
+                    "history_protocol": self._history_protocol,
+                    "transcript_html":  self.transcript.toHtml(),
+                }, f, indent=2, default=str)
         except Exception:
             pass
 
@@ -1366,14 +1552,21 @@ class AgentChatWidget(QtWidgets.QWidget):
         # one is running. Each Send spawns its own worker on its own
         # QThread; they run in parallel.
 
+        # Snapshot history AT SEND TIME. If a previous turn is still
+        # running, its future response isn't in this snapshot — accepted
+        # trade-off for allowing parallelism. Structured history recorded
+        # under another protocol is flattened to text so it stays valid.
+        protocol = cfg["protocol"]
+        history = self._history
+        if self._history_protocol not in (None, protocol):
+            history = _flatten_history(history)
+        history = _trim_history(history, self._HISTORY_MAX_TURNS)
+
         worker = _ChatWorker(
-            protocol=cfg["protocol"],
+            protocol=protocol,
             base_url=cfg["url"], api_key=cfg["key"], model=cfg["model"],
             system_prompt=cfg["system_prompt"],
-            # Snapshot history AT SEND TIME. If a previous turn is
-            # still running, its future response isn't in this
-            # snapshot — accepted trade-off for allowing parallelism.
-            history=list(self._history),
+            history=list(history),
             user_text=text,
             tool_ctx=cfg["tool_ctx"],
             confirm_helper=self._confirm_helper,
@@ -1384,7 +1577,8 @@ class AgentChatWidget(QtWidgets.QWidget):
         # history (not whatever _pending_user_text happens to be).
         worker.tool_event.connect(self._on_tool_event)
         worker.done.connect(
-            lambda a_text, usage, u=text: self._on_worker_done(u, a_text, usage))
+            lambda a_text, usage, turn, u=text, p=protocol:
+                self._on_worker_done(u, a_text, usage, turn, p))
         worker.error.connect(self._on_worker_error)
         worker.finished.connect(
             lambda w=worker: self._on_worker_finished(w))
@@ -1425,13 +1619,27 @@ class AgentChatWidget(QtWidgets.QWidget):
         else:
             self._append_tool_result(name, result)
 
-    def _on_worker_done(self, user_text, assistant_text, usage):
+    def _on_worker_done(self, user_text, assistant_text, usage,
+                        turn_msgs=None, protocol=None):
         # `user_text` is bound at Send time via lambda closure so the
         # right user turn is paired with the right assistant turn even
         # with multiple workers running in parallel and finishing out
-        # of order.
-        self._history.append({"role": "user", "content": user_text})
-        self._history.append({"role": "assistant", "content": assistant_text})
+        # of order. Each turn's messages form a self-contained block
+        # (user → tool_use/tool_result pairs → final reply), so blocks
+        # from parallel workers can be appended in completion order.
+        try:
+            entries = [_to_history_message(m) for m in (turn_msgs or [])]
+        except Exception:
+            entries = []
+        if not entries or not _is_turn_start(entries[0]):
+            entries = [{"role": "user", "content": user_text},
+                       {"role": "assistant", "content": assistant_text}]
+        if protocol and self._history_protocol not in (None, protocol):
+            self._history = _flatten_history(self._history)
+        if protocol:
+            self._history_protocol = protocol
+        self._history.extend(entries)
+        self._history = _trim_history(self._history, self._HISTORY_MAX_TURNS)
         self._append_transcript("assistant", assistant_text)
         try:
             self.assistant_replied.emit(assistant_text, dict(usage) if usage else {})
@@ -1487,6 +1695,7 @@ class AgentChatWidget(QtWidgets.QWidget):
 
     def _on_clear(self):
         self._history = []
+        self._history_protocol = None
         self.transcript.clear()
         self.status_label.setText("history cleared")
         # Wipe the persisted file too, so the next launch starts fresh.

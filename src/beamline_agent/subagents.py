@@ -102,6 +102,9 @@ SUBAGENT_KINDS: dict[str, dict] = {
         "tool_names":   [
             "bash", "read_file",
             "read_pv", "caput",
+            "read_motor", "check_motor_health", "check_pv_health",
+            "check_detector_stream", "ioc_status",
+            "list_docs", "read_doc", "search_docs",
             "open_beamline_plugin", "list_beamline_plugins",
             "view_hdf5_file",
             "view_detector_image", "get_detector_image_stats",
@@ -232,43 +235,30 @@ def tool_spawn_subagent(kind: str, task: str) -> dict:
             from .chat import (
                 _chat_anthropic, _chat_openai,
                 PROTOCOL_ANTHROPIC, PROTOCOL_OPENAI,
-                MAX_AGENT_ITERATIONS,
             )
-            # Temporarily raise the iteration cap for the sub-agent if
-            # its preset specifies one different from the default.
-            # `_chat_*` reads MAX_AGENT_ITERATIONS at call time, so
-            # patch it in the module namespace for the duration of
-            # this call. Restored in finally.
-            import pystream.agent.chat as chat_mod
-            orig_cap = chat_mod.MAX_AGENT_ITERATIONS
-            chat_mod.MAX_AGENT_ITERATIONS = int(preset.get("max_iterations")
-                                                or orig_cap)
-            try:
-                if protocol == PROTOCOL_ANTHROPIC:
-                    result_text, usage = _chat_anthropic(
-                        base_url, api_key, model,
-                        system_prompt=system_prompt,
-                        history=[],
-                        user_text=task,
-                        emit_tool=emit_tool or (lambda *a, **kw: None),
-                        confirm=confirm,
-                        tool_ctx=sub_tool_ctx,
-                    )
-                elif protocol == PROTOCOL_OPENAI:
-                    result_text, usage = _chat_openai(
-                        base_url, api_key, model,
-                        system_prompt=system_prompt,
-                        history=[],
-                        user_text=task,
-                        emit_tool=emit_tool or (lambda *a, **kw: None),
-                        confirm=confirm,
-                        tool_ctx=sub_tool_ctx,
-                    )
-                else:
-                    pub.error(f"unknown protocol {protocol!r}")
-                    return {"error": f"unknown protocol {protocol!r}"}
-            finally:
-                chat_mod.MAX_AGENT_ITERATIONS = orig_cap
+            # Per-kind iteration cap, passed straight to the tool loop.
+            # (Previously patched a module global via a stale
+            # `pystream.agent.chat` import, which raised
+            # ModuleNotFoundError on every spawn after the package split.)
+            cap = preset.get("max_iterations")
+            chat_kwargs = dict(
+                system_prompt=system_prompt,
+                history=[],
+                user_text=task,
+                emit_tool=emit_tool or (lambda *a, **kw: None),
+                confirm=confirm,
+                tool_ctx=sub_tool_ctx,
+                max_iterations=int(cap) if cap else None,
+            )
+            if protocol == PROTOCOL_ANTHROPIC:
+                result_text, usage = _chat_anthropic(
+                    base_url, api_key, model, **chat_kwargs)
+            elif protocol == PROTOCOL_OPENAI:
+                result_text, usage = _chat_openai(
+                    base_url, api_key, model, **chat_kwargs)
+            else:
+                pub.error(f"unknown protocol {protocol!r}")
+                return {"error": f"unknown protocol {protocol!r}"}
         except Exception as ex:
             pub.error(f"{type(ex).__name__}: {ex}")
             return {"error": f"sub-agent crashed: {type(ex).__name__}: {ex}",
