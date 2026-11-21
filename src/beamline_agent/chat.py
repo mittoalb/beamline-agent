@@ -1215,6 +1215,49 @@ def _chat_openai(base_url, api_key, model, system_prompt,
     return runner.run(system_prompt, history, user_text, turn_sink=turn_sink)
 
 
+def build_agent_config() -> Optional[dict]:
+    """Read persisted config + beamline tool context. Returns None if
+    URL/key/model missing. Called at SEND time (chat panel, Slack bot) so config edits (in
+    AgentDialog) and beamline changes are picked up on the very
+    next message."""
+    s = load_settings() or {}
+    url = (s.get("base_url") or "").strip()
+    key = (s.get("api_key") or "").strip()
+    model = (s.get("model") or "").strip()
+    # `key` is optional now — local OpenAI-compatible runners
+    # (Ollama, llama.cpp, vLLM, LM Studio) don't need one, and
+    # `_chat_openai` substitutes a sentinel when it's blank.
+    # `url` and `model` are still required — without them we
+    # have no server to talk to and no model to select.
+    if not (url and model):
+        return None
+    tool_ctx = _load_tool_context()
+    name = (s.get("agent_name") or DEFAULT_AGENT_NAME).strip() or DEFAULT_AGENT_NAME
+    addendum = tool_ctx.get("system_prompt_addendum", "") or ""
+    prompt = (
+        (s.get("system_prompt") or SYSTEM_PROMPT_DEFAULT)
+        .replace("{name}",     name)
+        .replace("{beamline}", _active_beamline())
+    )
+    if "{beamline_addendum}" in prompt:
+        prompt = prompt.replace("{beamline_addendum}", addendum)
+    elif addendum:
+        # A saved custom prompt without the placeholder used to drop
+        # the beamline rules (IOC handling, PV cheat sheet, …) entirely.
+        prompt = prompt.rstrip() + "\n\n" + addendum
+    prompt = prompt.rstrip() + "\n\n" + CORE_RULES
+    return {
+        "protocol":      s.get("protocol", PROTOCOL_ANTHROPIC),
+        "url":           url,
+        "key":           key,
+        "model":         model,
+        "system_prompt": prompt,
+        "agent_name":    name,
+        "beamline":      _active_beamline(),
+        "tool_ctx":      tool_ctx,
+    }
+
+
 # ── worker thread ───────────────────────────────────────────────────────
 
 class _ChatWorker(QtCore.QThread):
@@ -1528,46 +1571,7 @@ class AgentChatWidget(QtWidgets.QWidget):
 
     # ── chat flow ────────────────────────────────────────────────────
     def _load_config(self) -> Optional[dict]:
-        """Read persisted config + beamline tool context. Returns None if
-        URL/key/model missing. Called at SEND time so config edits (in
-        AgentDialog) and beamline changes are picked up on the very
-        next message."""
-        s = load_settings() or {}
-        url = (s.get("base_url") or "").strip()
-        key = (s.get("api_key") or "").strip()
-        model = (s.get("model") or "").strip()
-        # `key` is optional now — local OpenAI-compatible runners
-        # (Ollama, llama.cpp, vLLM, LM Studio) don't need one, and
-        # `_chat_openai` substitutes a sentinel when it's blank.
-        # `url` and `model` are still required — without them we
-        # have no server to talk to and no model to select.
-        if not (url and model):
-            return None
-        tool_ctx = _load_tool_context()
-        name = (s.get("agent_name") or DEFAULT_AGENT_NAME).strip() or DEFAULT_AGENT_NAME
-        addendum = tool_ctx.get("system_prompt_addendum", "") or ""
-        prompt = (
-            (s.get("system_prompt") or SYSTEM_PROMPT_DEFAULT)
-            .replace("{name}",     name)
-            .replace("{beamline}", _active_beamline())
-        )
-        if "{beamline_addendum}" in prompt:
-            prompt = prompt.replace("{beamline_addendum}", addendum)
-        elif addendum:
-            # A saved custom prompt without the placeholder used to drop
-            # the beamline rules (IOC handling, PV cheat sheet, …) entirely.
-            prompt = prompt.rstrip() + "\n\n" + addendum
-        prompt = prompt.rstrip() + "\n\n" + CORE_RULES
-        return {
-            "protocol":      s.get("protocol", PROTOCOL_ANTHROPIC),
-            "url":           url,
-            "key":           key,
-            "model":         model,
-            "system_prompt": prompt,
-            "agent_name":    name,
-            "beamline":      _active_beamline(),
-            "tool_ctx":      tool_ctx,
-        }
+        return build_agent_config()
 
     def _on_send(self):
         text = self.input_edit.text().strip()

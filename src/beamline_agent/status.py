@@ -268,8 +268,19 @@ class AgentStatusPublisher:
             self._record["progress"] = {"done": int(done), "total": max(1, int(total))}
         except (TypeError, ValueError):
             self._record["progress"] = None
+        if self._record.get("state") == "starting":
+            self._record["state"] = "running"
         if text:
             self._record["activity"] = str(text)
+        self._push()
+
+    def set_info(self, **fields) -> None:
+        """Attach free-form key/value details to the record (scan type,
+        output file, parameters …). Merged into `record["info"]`; values
+        must be JSON-serialisable. Pushes immediately."""
+        info = dict(self._record.get("info") or {})
+        info.update(fields)
+        self._record["info"] = info
         self._push()
 
     def finish(self, summary: str = "") -> None:
@@ -306,6 +317,26 @@ class AgentStatusPublisher:
         elif not self._closed:
             self.finish()
         return False   # never swallow exceptions
+
+
+# ── scans ───────────────────────────────────────────────────────────
+
+SCAN_KIND  = "scan"
+SCAN_TTL_S = 900      # a single scan step (energy + reference, a tomo
+                      # rotation) can take minutes; don't flag it stale
+
+
+def scan_publisher(name: str, **info) -> AgentStatusPublisher:
+    """Publisher for a running acquisition (XANES, time series, DataMap,
+    …) rather than an AI agent. Same registry, `kind="scan"`, a longer
+    TTL. `info` is stored in the record's `info` dict. Call
+    `.activity()` / `.progress()` while running and `.finish()` /
+    `.error()` at the end."""
+    pub = AgentStatusPublisher(name=name, kind=SCAN_KIND,
+                               ttl_s=SCAN_TTL_S, parent="")
+    if info:
+        pub._record["info"] = dict(info)
+    return pub
 
 
 # ── helper for spawned children ──────────────────────────────────────

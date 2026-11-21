@@ -354,6 +354,118 @@ def tool_view_hdf5_file(path: str) -> dict:
         return {"error": f"{type(ex).__name__}: {ex}", "path": path}
 
 
+# ── what's running: scans / agents registry, beamline programs ────────
+
+def _fmt_age(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def tool_list_running_scans(include_agents: bool = True) -> dict:
+    """Read ~/.aps_agents/agents.json — scans (XANES 1D/2D, 2D Time
+    Series, DataMap, energy scan …) and AI agents publish their live
+    state there from any beamline host. READ-ONLY."""
+    import time
+    from .status import load_registry, DEFAULT_TTL_S, AGENTS_FILE
+    now = time.time()
+    scans, agents = [], []
+    for rec in load_registry().values():
+        if not isinstance(rec, dict):
+            continue
+        state = rec.get("state") or "?"
+        age = now - float(rec.get("updated_ts") or 0)
+        ttl = float(rec.get("ttl_s") or DEFAULT_TTL_S)
+        if state not in ("done", "error") and age > ttl:
+            state = "stale (no update in %s — process may have died)" % _fmt_age(age)
+        row = {
+            "name": rec.get("name"), "host": rec.get("host"),
+            "state": state, "activity": rec.get("activity") or "",
+            "progress": rec.get("progress"),
+            "running_for": _fmt_age(now - float(rec.get("started_ts") or now)),
+            "last_update_ago": _fmt_age(age),
+        }
+        if rec.get("info"):
+            row["info"] = rec["info"]
+        (scans if rec.get("kind") == "scan" else agents).append(row)
+    out = {"registry": AGENTS_FILE, "scans": scans}
+    if include_agents:
+        out["agents"] = agents
+    if not scans:
+        out["note"] = ("No scan records. Scans launched from tools that "
+                       "don't publish (e.g. TomoScan) won't appear here — "
+                       "check them separately.")
+    return out
+
+
+# Substrings matched against each process's command line. Override /
+# extend with ~/.pystream/watched_programs.json: {"programs": {"label":
+# "substring", ...}} (merged on top of these).
+_DEFAULT_WATCHED_PROGRAMS = {
+    "pystream":          "pystream",
+    "XANES 2D GUI":      "xanes_gui/gui_2d.py",
+    "XANES GUI":         "xanes_gui/gui.py",
+    "tomoscan":          "tomoscan",
+}
+
+
+def _watched_programs() -> dict:
+    progs = dict(_DEFAULT_WATCHED_PROGRAMS)
+    try:
+        with open(os.path.join(PYSTREAM_HOME, "watched_programs.json")) as f:
+            extra = json.load(f).get("programs") or {}
+        progs.update({str(k): str(v) for k, v in extra.items() if v})
+    except (OSError, ValueError, AttributeError):
+        pass
+    return progs
+
+
+def tool_list_running_programs() -> dict:
+    """List beamline programs (GUIs, scan/recon processes) running on
+    THIS host, from a fixed ps listing matched against a known-name
+    table. Takes no command input. READ-ONLY."""
+    import subprocess
+    import socket
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,user=,etimes=,args="],
+                            capture_output=True, text=True, timeout=10)
+    except Exception as ex:
+        return {"error": f"ps failed: {type(ex).__name__}: {ex}"}
+    progs = _watched_programs()
+    found = []
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, user, etimes, args = parts
+        if "ps -eo" in args:
+            continue
+        # Match program names, not the whole line: the interpreter path
+        # (".../envs/pystream/bin/python") would otherwise match
+        # everything launched from that env. Needles containing "/" are
+        # matched against the end of the leading tokens (script paths).
+        toks = [t.lower() for t in args.split()[:4]]
+        names = [os.path.basename(t) for t in toks]
+        for label, needle in progs.items():
+            n = needle.lower()
+            hit = any(t.endswith(n) for t in toks) if "/" in n else \
+                  any(b.startswith(n) for b in names)
+            if hit:
+                found.append({"program": label, "pid": int(pid),
+                              "user": user,
+                              "running_for": _fmt_age(float(etimes or 0)),
+                              "command": args[:200]})
+                break
+    return {"host": socket.gethostname().split(".")[0],
+            "programs": found,
+            "watched": sorted(progs),
+            "note": "Only this host. Other hosts' scans show up via "
+                    "list_running_scans."}
+
+
 CORE_TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_beamline_plugins",
@@ -567,6 +679,32 @@ CORE_TOOLS: list[dict[str, Any]] = [
             "required": ["task_slug"],
         },
         "func": tool_read_task_recording,
+    },
+    {
+        "name": "list_running_scans",
+        "description": (
+            "What acquisitions and AI agents are running right now, on any "
+            "beamline host: XANES 1D/2D, 2D Time Series, DataMap, energy "
+            "scan … publish name, state, progress n/N, current step and "
+            "output file here. Use for 'is a scan running', 'what scan', "
+            "'how far along', 'where is the data going'. TomoScan does "
+            "NOT publish here — check it with the beamline's TomoScan tool."
+        ),
+        "schema": {"type": "object", "properties": {
+            "include_agents": {"type": "boolean",
+                               "description": "Also list AI agents (default true)."},
+        }, "required": []},
+        "func": tool_list_running_scans,
+    },
+    {
+        "name": "list_running_programs",
+        "description": (
+            "Which beamline programs are running on this host (pystream, "
+            "the XANES 1D/2D GUIs, tomoscan) with PID, user and uptime. Use for 'what tools are "
+            "open', 'is the XANES GUI running'. Read-only; no arguments."
+        ),
+        "schema": {"type": "object", "properties": {}, "required": []},
+        "func": tool_list_running_programs,
     },
 ]
 

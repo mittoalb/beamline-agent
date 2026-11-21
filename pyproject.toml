@@ -42,10 +42,16 @@ epics = [
     "pyepics>=3.5",          # for beamline-provided caget/caput tools
     "pvapy",                 # for PVA detector streams
 ]
+slack = [
+    "slack_bolt>=1.18",      # read-only Slack status bot (slack_bridge)
+]
 dev = [
     "pytest>=7",
     "pytest-qt>=4",
 ]
+
+[project.scripts]
+beamline-agent-slack = "beamline_agent.slack_bridge:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
