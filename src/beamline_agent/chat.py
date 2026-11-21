@@ -696,16 +696,24 @@ def _supports_thinking(model: str) -> bool:
 
 
 def _uses_adaptive_thinking(model: str) -> bool:
-    """True for models that require the newer `thinking.type=adaptive`
-    API shape (Sonnet 5+, Opus 5+, Fable 5+, Haiku 5+). Older thinking-
-    capable models (Sonnet 4.x, Opus 4.x, Haiku 4.5, Claude 3.7) still
-    use `thinking.type=enabled` with an explicit `budget_tokens`."""
+    """True for models that need `thinking.type=adaptive` (+ effort):
+    every 5.x model and Fable, plus Opus/Sonnet 4.6 and later (4.7 and
+    4.8 reject `type=enabled` with a 400). Older thinking-capable models
+    (Haiku 4.5, Opus/Sonnet 4.0-4.5, Claude 3.7) still take
+    `type=enabled` + `budget_tokens`. Handles friendly names ("Claude
+    Opus 4.7"), API ids ("claude-opus-4-7"), dated ids
+    ("claude-opus-4-20250514" = 4.0) and Bedrock/Vertex forms."""
     if not model:
         return False
-    return bool(re.search(
-        r"(?:sonnet|opus|haiku|fable)[\s\-_.@/]*[5-9]",
-        model.lower(),
-    ))
+    m = re.search(r"(sonnet|opus|haiku|fable)[\s\-_.@/]*(\d)"
+                  r"(?:[\s\-_.](\d{1,2})(?!\d))?", model.lower())
+    if not m:
+        return False
+    family, major = m.group(1), int(m.group(2))
+    minor = int(m.group(3)) if m.group(3) else 0
+    if family == "fable" or major >= 5:
+        return True
+    return major == 4 and minor >= 6 and family in ("opus", "sonnet")
 
 
 class _ProviderAdapter:
@@ -857,9 +865,9 @@ class _AnthropicAdapter(_ProviderAdapter):
         if self.thinking_budget > 0:
             # Two thinking API shapes coexist in the Anthropic model
             # lineup:
-            #   * v4.x, 3.7 → `{"type":"enabled","budget_tokens":N}` —
+            #   * ≤4.5, 3.7 → `{"type":"enabled","budget_tokens":N}` —
             #     caller sets the budget.
-            #   * v5+ → `{"type":"adaptive"}` + `output_config.effort`
+            #   * 4.6+, 5+ → `{"type":"adaptive"}` + `output_config.effort`
             #     — the model decides its own budget based on task
             #     complexity. Sonnet 5 hard-rejects the older shape.
             if _uses_adaptive_thinking(self.model):
